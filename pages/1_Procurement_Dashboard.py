@@ -30,7 +30,14 @@ st.markdown("""<style>
 st.title("Procurement Dashboard")
 
 if not is_connected():
-    st.error("Snowflake connection unavailable. Check credentials in .streamlit/secrets.toml")
+    st.error("Snowflake connection unavailable. Check credentials in secrets.")
+    conn_error = st.session_state.get("conn_error")
+    conn_traceback = st.session_state.get("conn_traceback")
+    if conn_error:
+        st.code(conn_error)
+    if conn_traceback:
+        with st.expander("Full traceback"):
+            st.code(conn_traceback)
     st.stop()
 
 

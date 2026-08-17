@@ -1,4 +1,10 @@
+import logging
+import traceback
 import streamlit as st
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("procurement_ai.snowflake")
+
 
 def get_snowflake_connection():
     """Get Snowflake connection - supports Streamlit-in-Snowflake (SiS) and external."""
@@ -11,28 +17,47 @@ def get_snowflake_connection():
         session = get_active_session()
         st.session_state["snowflake_conn"] = session
         st.session_state["conn_mode"] = "sis"
+        logger.info("Connected via Streamlit-in-Snowflake (SiS) session.")
         return session
-    except Exception:
-        pass
+    except Exception as e:
+        logger.info("SiS session not available (%s) - falling back to external connector.", e)
 
     # Mode 2: External via snowflake-connector-python
+    account = st.secrets.get("SNOWFLAKE_ACCOUNT", "")
+    user = st.secrets.get("SNOWFLAKE_USER", "")
+    warehouse = st.secrets.get("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH")
+    database = st.secrets.get("SNOWFLAKE_DATABASE", "SAP_P2P_FINANCE_DEV")
+    schema = st.secrets.get("SNOWFLAKE_SCHEMA", "GOLD")
+    role = st.secrets.get("SNOWFLAKE_ROLE", "ACCOUNTADMIN")
+    has_password = bool(st.secrets.get("SNOWFLAKE_PASSWORD", ""))
+
+    logger.info(
+        "Attempting external Snowflake connection: account=%r user=%r warehouse=%r "
+        "database=%r schema=%r role=%r password_set=%s",
+        account, user, warehouse, database, schema, role, has_password,
+    )
+
     try:
         import snowflake.connector
         conn = snowflake.connector.connect(
-            account=st.secrets.get("SNOWFLAKE_ACCOUNT", ""),
-            user=st.secrets.get("SNOWFLAKE_USER", ""),
+            account=account,
+            user=user,
             password=st.secrets.get("SNOWFLAKE_PASSWORD", ""),
-            warehouse=st.secrets.get("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH"),
-            database=st.secrets.get("SNOWFLAKE_DATABASE", "SAP_P2P_FINANCE_DEV"),
-            schema=st.secrets.get("SNOWFLAKE_SCHEMA", "GOLD"),
-            role=st.secrets.get("SNOWFLAKE_ROLE", "ACCOUNTADMIN"),
+            warehouse=warehouse,
+            database=database,
+            schema=schema,
+            role=role,
         )
         st.session_state["snowflake_conn"] = conn
         st.session_state["conn_mode"] = "connector"
+        logger.info("Snowflake connector connection established successfully.")
         return conn
     except Exception as e:
+        tb = traceback.format_exc()
+        logger.error("Snowflake connection failed: %s\n%s", e, tb)
         st.session_state["snowflake_conn"] = None
         st.session_state["conn_error"] = str(e)
+        st.session_state["conn_traceback"] = tb
         return None
 
 
