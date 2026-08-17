@@ -1,0 +1,18 @@
+definition_version: 2
+
+entities:
+  procurement_dashboard:
+    type: streamlit
+    identifier:
+      name: PROCUREMENT_DASHBOARD
+      schema: GOLD
+      database: SAP_P2P_FINANCE_DEV
+    title: "CoCoEV ProcureIQ"
+    query_warehouse: COMPUTE_WH
+    main_file: app.py
+    pages_dir: pages/
+    artifacts:
+      - config/
+      - services/
+      - components/
+    stage: GOLD.STREAMLIT_STAGE

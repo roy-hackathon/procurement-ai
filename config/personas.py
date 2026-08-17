@@ -1,0 +1,2 @@
+PERSONAS = {}
+DEFAULT_PERSONA = None
