@@ -9,9 +9,9 @@ from services.queries import (
     get_filter_options, get_kpi_metrics, get_spend_trend,
     get_spend_by_vendor, get_order_pipeline, get_spend_by_region
 )
-from config.settings import FISCAL_YEARS, DEFAULT_YEAR
+from config.settings import FISCAL_YEARS, DEFAULT_YEAR, APP_VERSION
 
-st.set_page_config(page_title="Procurement Dashboard", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title=f"Procurement Dashboard v{APP_VERSION}", layout="wide", initial_sidebar_state="collapsed")
 
 # Borders around cards and charts
 st.markdown("""<style>
@@ -27,7 +27,7 @@ st.markdown("""<style>
 }
 </style>""", unsafe_allow_html=True)
 
-st.title("Procurement Dashboard")
+st.title(f"Procurement Dashboard v{APP_VERSION}")
 
 if not is_connected():
     st.error("Snowflake connection unavailable. Check credentials in secrets.")
