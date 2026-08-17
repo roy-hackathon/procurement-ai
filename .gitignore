@@ -4,3 +4,4 @@ __pycache__/
 .env
 output/
 .streamlit/secrets.toml
+setup_streamlit_user.sql
