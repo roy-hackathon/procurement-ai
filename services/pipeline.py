@@ -84,6 +84,15 @@ def _execute(conn, sql, params=None):
 
 
 def _v(obj):
+    if obj is None:
+        return '{}'
+    if isinstance(obj, str):
+        # Already a JSON string — validate and return as-is
+        try:
+            json.loads(obj)
+            return obj
+        except (json.JSONDecodeError, ValueError):
+            return json.dumps(obj, default=str)
     return json.dumps(obj, default=str)
 
 
@@ -122,17 +131,20 @@ def phase_detect(conn, run_id, progress_callback=None):
                     total_refreshed += 1
                 else:
                     impact = float(evt.get("IMPACT_USD", 0) or 0)
+                    affected_keys = _v(evt.get("AFFECTED_KEYS", {}))
                     _execute(conn, f"""
                         INSERT INTO {DATABASE}.ACTION.BUSINESS_EVENT
                         (RUN_ID, EVENT_TYPE, PATTERN_CLASS, DOMAIN_PACK, ENTITY_KEY, SEVERITY, IMPACT_USD, HEADLINE, DESCRIPTION, AFFECTED_KEYS, STATUS, DETECTED_AT, LAST_SEEN_AT, SEEN_COUNT, PERIOD_KEY)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'open', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(), 1, %s)
+                        SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, PARSE_JSON(%s), 'open', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(), 1, %s
                     """, (run_id, event_type, evt.get("PATTERN_CLASS", "threshold_breach"), det.get("DOMAIN_PACK", "finance"),
                           entity_key, evt.get("SEVERITY", "MEDIUM"), impact, evt.get("HEADLINE", f"{det_name}: {entity_key}"),
-                          evt.get("DESCRIPTION", ""), _v(evt.get("AFFECTED_KEYS", {})),
+                          evt.get("DESCRIPTION", ""), affected_keys,
                           datetime.utcnow().strftime("%Y-%m")))
                     total_inserted += 1
         except Exception as e:
             errors.append(f"{det_name}: {e}")
+            if progress_callback:
+                progress_callback(f"  Error: {det_name}: {e}")
 
     return {"inserted": total_inserted, "refreshed": total_refreshed, "detectors": len(detectors), "errors": errors}
 
@@ -163,51 +175,208 @@ def phase_investigate(conn, run_id, limit=50, progress_callback=None):
 
 def _investigate_event(conn, run_id, event):
     etype = event["EVENT_TYPE"]
+    entity_key = event["ENTITY_KEY"]
+    impact_usd = float(event.get("IMPACT_USD") or 0)
+
+    # --- 7-hop evidence traversal (actual SQL queries) ---
+    evidence = {}
+    vendor_id = entity_key.split("|")[0] if "|" in entity_key else entity_key
+
+    # Hop 1: Vendor PO summary
+    po_stats = _query(conn, f"""
+        SELECT COUNT(*) AS PO_COUNT, COALESCE(SUM(GROSS_VALUE), 0) AS TOTAL_PO_VALUE,
+               COALESCE(AVG(GROSS_VALUE), 0) AS AVG_PO_VALUE
+        FROM {DATABASE}.GOLD.FCT_PURCHASE_ORDERS
+        WHERE VENDOR_SK IN (SELECT VENDOR_SK FROM {DATABASE}.GOLD.DIM_VENDOR WHERE VENDOR_ID = %s)
+    """, (vendor_id,))
+    if po_stats:
+        evidence["hop1_po"] = po_stats[0]
+
+    # Hop 2: GR vs IR from PO History
+    gr_ir = _query(conn, f"""
+        SELECT h.EVENT_TYPE, COUNT(*) AS CNT, COALESCE(SUM(h.AMOUNT_LOCAL_CURRENCY), 0) AS TOTAL_VALUE
+        FROM {DATABASE}.GOLD.FCT_PO_HISTORY h
+        JOIN {DATABASE}.GOLD.FCT_PURCHASE_ORDERS po ON po.PO_ID = h.PO_ID AND po.PO_LINE = h.PO_LINE
+        WHERE po.VENDOR_SK IN (SELECT VENDOR_SK FROM {DATABASE}.GOLD.DIM_VENDOR WHERE VENDOR_ID = %s)
+        GROUP BY h.EVENT_TYPE
+    """, (vendor_id,))
+    gr_value = sum(float(r["TOTAL_VALUE"]) for r in gr_ir if r["EVENT_TYPE"] == 1)
+    ir_value = sum(float(r["TOTAL_VALUE"]) for r in gr_ir if r["EVENT_TYPE"] == 2)
+    gr_count = sum(int(r["CNT"]) for r in gr_ir if r["EVENT_TYPE"] == 1)
+    ir_count = sum(int(r["CNT"]) for r in gr_ir if r["EVENT_TYPE"] == 2)
+    evidence["hop2_gr_ir"] = {"gr_value": gr_value, "ir_value": ir_value, "gr_count": gr_count, "ir_count": ir_count}
+
+    # Hop 3: Invoice totals
+    inv_stats = _query(conn, f"""
+        SELECT COUNT(*) AS INV_COUNT, COALESCE(SUM(GROSS_INVOICE_AMOUNT), 0) AS TOTAL_INVOICED,
+               COALESCE(AVG(GROSS_INVOICE_AMOUNT), 0) AS AVG_INVOICE
+        FROM {DATABASE}.GOLD.FCT_AP_INVOICES
+        WHERE VENDOR_SK IN (SELECT VENDOR_SK FROM {DATABASE}.GOLD.DIM_VENDOR WHERE VENDOR_ID = %s)
+    """, (vendor_id,))
+    if inv_stats:
+        evidence["hop3_invoices"] = inv_stats[0]
+
+    # Hop 4: Materials and plants affected
+    mat_plant = _query(conn, f"""
+        SELECT m.MATERIAL_GROUP, p.PLANT_NAME, COUNT(*) AS PO_LINES
+        FROM {DATABASE}.GOLD.FCT_PURCHASE_ORDERS po
+        JOIN {DATABASE}.GOLD.DIM_MATERIAL m ON m.MATERIAL_SK = po.MATERIAL_SK
+        JOIN {DATABASE}.GOLD.DIM_PLANT p ON p.PLANT_SK = po.PLANT_SK
+        WHERE po.VENDOR_SK IN (SELECT VENDOR_SK FROM {DATABASE}.GOLD.DIM_VENDOR WHERE VENDOR_ID = %s)
+        GROUP BY m.MATERIAL_GROUP, p.PLANT_NAME
+        ORDER BY PO_LINES DESC LIMIT 10
+    """, (vendor_id,))
+    evidence["hop4_materials_plants"] = mat_plant
+    material_groups = list(set(r["MATERIAL_GROUP"] for r in mat_plant))
+    plants_affected = list(set(r["PLANT_NAME"] for r in mat_plant))
+
+    # Hop 5: AP open items
+    ap_items = _query(conn, f"""
+        SELECT COUNT(*) AS OPEN_ITEMS, COALESCE(SUM(AMOUNT_LOCAL_CURRENCY), 0) AS TOTAL_OPEN
+        FROM {DATABASE}.GOLD.FCT_AP_OPEN_ITEMS
+        WHERE VENDOR_SK IN (SELECT VENDOR_SK FROM {DATABASE}.GOLD.DIM_VENDOR WHERE VENDOR_ID = %s)
+    """, (vendor_id,))
+    if ap_items:
+        evidence["hop5_ap_open"] = ap_items[0]
+
+    # Hop 6: Vendor name lookup
+    vendor_info = _query(conn, f"SELECT VENDOR_NAME, COUNTRY FROM {DATABASE}.GOLD.DIM_VENDOR WHERE VENDOR_ID = %s", (vendor_id,))
+    vendor_name = vendor_info[0]["VENDOR_NAME"] if vendor_info else vendor_id
+    vendor_country = vendor_info[0].get("COUNTRY", "?") if vendor_info else "?"
+
+    # --- Determine root cause from evidence ---
     branch = "indeterminate"
     confidence = 0.30
-    hypotheses = [{"branch": "indeterminate", "score": 0.30, "reason": f"Default for {etype}"}]
-    narrative = f"Event {event['EVENT_ID']} ({etype}) on entity {event['ENTITY_KEY']}."
-    evidence_complete = False
+    hypotheses = []
+    evidence_complete = True
     missing = None
 
+    po_total = float(evidence.get("hop1_po", {}).get("TOTAL_PO_VALUE", 0) or 0)
+    inv_total = float(evidence.get("hop3_invoices", {}).get("TOTAL_INVOICED", 0) or 0)
+    avg_po = float(evidence.get("hop1_po", {}).get("AVG_PO_VALUE", 0) or 0)
+    avg_inv = float(evidence.get("hop3_invoices", {}).get("AVG_INVOICE", 0) or 0)
+    ap_open_total = float(evidence.get("hop5_ap_open", {}).get("TOTAL_OPEN", 0) or 0)
+
     if etype == "invoice_over_po":
-        branch, confidence, hypotheses, evidence_complete, missing = "price_variance", 0.85, [
-            {"branch": "price_variance", "score": 0.85, "reason": "Invoice exceeds PO value — price uplift likely"},
-            {"branch": "duplicate_ir", "score": 0.40, "reason": "Possible duplicate invoice receipt"},
-        ], True, None
-        narrative = f"Invoice overbilling detected on {event['ENTITY_KEY']}. Primary hypothesis: price variance by vendor."
-    elif etype == "duplicate_invoice_receipt":
-        branch, confidence, hypotheses = "duplicate_ir", 0.90, [{"branch": "duplicate_ir", "score": 0.90, "reason": "Multiple invoice receipts against one PO line"}]
-        evidence_complete = True
-        narrative = f"Duplicate invoice receipt detected on {event['ENTITY_KEY']}. Payment hold recommended."
-    elif etype == "po_invoice_currency_mismatch":
-        branch, confidence, hypotheses = "currency_control_gap", 0.95, [{"branch": "currency_control_gap", "score": 0.95, "reason": "PO and invoice currencies differ"}]
-        evidence_complete = True
-        narrative = f"Currency mismatch on {event['ENTITY_KEY']}. Three-way match cannot be evaluated."
+        # Key signal: does GR exceed IR? If yes, vendor has NOT overbilled
+        if gr_value > ir_value:
+            uninvoiced_gap = gr_value - ir_value
+            branch = "goods_receipt_no_invoice"
+            confidence = 0.85
+            hypotheses = [
+                {"branch": "goods_receipt_no_invoice", "score": 0.85,
+                 "reason": f"GR value (${gr_value:,.0f}) EXCEEDS IR value (${ir_value:,.0f}). Vendor has NOT overbilled. Real risk: ${uninvoiced_gap:,.0f} in uninvoiced goods."},
+                {"branch": "price_variance", "score": 0.25,
+                 "reason": f"Apparent overbilling is aggregation mismatch: avg PO ${avg_po:,.0f} (unit) vs avg invoice ${avg_inv:,.0f} (batch). Cannot confirm line-level price inflation."},
+                {"branch": "duplicate_ir", "score": 0.10,
+                 "reason": "Cannot rule out without line-level PO-to-invoice matching (PO_ID on invoices is NULL)."},
+            ]
+            evidence_complete = False
+            missing = "Line-level PO-to-invoice matching not available (PO_ID NULL on invoices)"
+            narrative = (
+                f"Five-Why Investigation for {vendor_name} ({vendor_country}):\n"
+                f"1. Why does invoiced (${inv_total:,.0f}) appear to exceed PO value (${po_total:,.0f})? "
+                f"PO lines are unit-level (avg ${avg_po:,.0f}), invoices are batch-level (avg ${avg_inv:,.0f}). Different aggregation levels.\n"
+                f"2. Is the vendor actually overcharging? NO. GR value (${gr_value:,.0f}) > IR value (${ir_value:,.0f}). "
+                f"Vendor billed LESS than goods received.\n"
+                f"3. What is the real risk? ${uninvoiced_gap:,.0f} in goods received without invoice = AP accrual uncertainty.\n"
+                f"4. How widespread? {len(plants_affected)} plants, {len(material_groups)} material groups affected.\n"
+                f"5. Business impact: If bulk invoices arrive simultaneously, cash flow spike. "
+                f"AP open items: ${ap_open_total:,.0f}. Period close at risk."
+            )
+        else:
+            branch = "price_variance"
+            confidence = 0.80
+            overage = inv_total - gr_value if inv_total > gr_value else inv_total - po_total
+            hypotheses = [
+                {"branch": "price_variance", "score": 0.80,
+                 "reason": f"IR value (${ir_value:,.0f}) exceeds GR value (${gr_value:,.0f}). Possible genuine overbilling of ${overage:,.0f}."},
+                {"branch": "duplicate_ir", "score": 0.40,
+                 "reason": "Multiple invoice receipts may have inflated the total."},
+            ]
+            narrative = (
+                f"Five-Why Investigation for {vendor_name} ({vendor_country}):\n"
+                f"1. Why does invoiced exceed PO? Invoice total ${inv_total:,.0f} vs PO total ${po_total:,.0f}.\n"
+                f"2. Is this genuine overbilling? IR value (${ir_value:,.0f}) > GR value (${gr_value:,.0f}) — YES, possible price inflation.\n"
+                f"3. How much exposure? ${overage:,.0f} potential overbilling.\n"
+                f"4. Scope: {len(plants_affected)} plants, {len(material_groups)} material groups.\n"
+                f"5. Impact: Payment hold recommended pending vendor reconciliation."
+            )
+
     elif etype == "grir_aging":
-        branch, confidence, hypotheses = "goods_receipt_no_invoice", 0.85, [{"branch": "goods_receipt_no_invoice", "score": 0.85, "reason": "Goods received with no matching invoice"}]
-        evidence_complete = True
-        narrative = f"GR/IR aging on {event['ENTITY_KEY']}. Open exposure without invoice."
+        gap = gr_value - ir_value
+        branch = "goods_receipt_no_invoice"
+        confidence = 0.85
+        hypotheses = [
+            {"branch": "goods_receipt_no_invoice", "score": 0.85,
+             "reason": f"{gr_count} goods receipts (${gr_value:,.0f}) vs {ir_count} invoice receipts (${ir_value:,.0f}). Gap: ${gap:,.0f} uninvoiced."},
+            {"branch": "duplicate_ir", "score": 0.10,
+             "reason": "Possible invoice received but not matched due to reference mismatch."},
+        ]
+        narrative = (
+            f"Five-Why Investigation for {vendor_name} ({vendor_country}):\n"
+            f"1. Why is there a GR/IR gap? {gr_count} goods receipts (${gr_value:,.0f}) vs {ir_count} invoice receipts (${ir_value:,.0f}).\n"
+            f"2. How large is the uninvoiced exposure? ${gap:,.0f} in goods received without matching invoice.\n"
+            f"3. Is this vendor-specific or systemic? Affects {len(plants_affected)} plants, {len(material_groups)} material groups — likely process bottleneck.\n"
+            f"4. What materials are at risk? {', '.join(material_groups[:5])}.\n"
+            f"5. Business impact: AP accrual uncertainty for period close. If vendor submits bulk invoice, "
+            f"cash flow spike of ${gap:,.0f}. Auditors flag unmatched GR/IR beyond 30 days."
+        )
+
+    elif etype == "ap_open_item_aging":
+        branch = "no_goods_receipt"
+        confidence = 0.75
+        hypotheses = [
+            {"branch": "no_goods_receipt", "score": 0.75,
+             "reason": f"Open AP item (${impact_usd:,.0f}) aging beyond payment terms. Vendor may escalate or withhold supply."},
+            {"branch": "payment_terms_drift", "score": 0.20,
+             "reason": "Payment terms may have shifted, creating apparent aging."},
+        ]
+        narrative = (
+            f"Five-Why Investigation for {vendor_name} ({vendor_country}):\n"
+            f"1. Why is this AP item open? Payable of ${impact_usd:,.0f} remains unpaid beyond agreed terms.\n"
+            f"2. Is this isolated? Vendor has {int(evidence.get('hop5_ap_open', {}).get('OPEN_ITEMS', 0) or 0)} open items "
+            f"totaling ${ap_open_total:,.0f}.\n"
+            f"3. What is the vendor's importance? Supplies {len(material_groups)} material groups across {len(plants_affected)} plants.\n"
+            f"4. What is the risk? Vendor relationship deterioration, potential supply withholding.\n"
+            f"5. Business impact: If {vendor_name} withholds supply, affects {', '.join(material_groups[:3])} "
+            f"at {', '.join(p.replace('CoCoEV Plant ', '') for p in plants_affected[:3])}."
+        )
+
+    elif etype == "duplicate_invoice_receipt":
+        branch = "duplicate_ir"
+        confidence = 0.90
+        hypotheses = [{"branch": "duplicate_ir", "score": 0.90, "reason": "Multiple invoice receipts against same PO line."}]
+        narrative = f"Duplicate invoice receipt for {vendor_name}. Payment hold recommended. GR: ${gr_value:,.0f}, IR: ${ir_value:,.0f}."
+
+    elif etype == "po_invoice_currency_mismatch":
+        branch = "currency_control_gap"
+        confidence = 0.95
+        hypotheses = [{"branch": "currency_control_gap", "score": 0.95, "reason": "PO and invoice currencies differ."}]
+        narrative = f"Currency mismatch for {vendor_name}. Three-way match cannot be evaluated until resolved."
+
     elif etype == "unusual_payment_terms":
-        branch, confidence, hypotheses = "payment_terms_drift", 0.70, [{"branch": "payment_terms_drift", "score": 0.70, "reason": "Payment terms deviate from vendor baseline"}]
+        branch = "payment_terms_drift"
+        confidence = 0.70
+        hypotheses = [{"branch": "payment_terms_drift", "score": 0.70, "reason": "Payment terms deviate from vendor baseline."}]
         evidence_complete = False
-        missing = "no corroborating signal beyond terms comparison"
-        narrative = f"Payment terms anomaly on {event['ENTITY_KEY']}. Master-data governance review needed."
-    elif etype in ("ap_open_item_aging",):
-        branch, confidence, hypotheses = "goods_receipt_no_invoice", 0.75, [{"branch": "goods_receipt_no_invoice", "score": 0.75, "reason": "AP open item aging beyond normal cycle"}]
-        evidence_complete = True
-        narrative = f"AP aging detected on {event['ENTITY_KEY']}."
+        missing = "No corroborating signal beyond terms comparison"
+        narrative = f"Payment terms anomaly for {vendor_name}. Master-data governance review needed."
+
+    else:
+        narrative = f"Event {event['EVENT_ID']} ({etype}) on {vendor_name}. No specific investigation pattern available."
 
     # Persist to INVESTIGATION
     _execute(conn, f"""
         INSERT INTO {DATABASE}.ACTION.INVESTIGATION
         (EVENT_ID, RUN_ID, ROOT_CAUSE_BRANCH, CONFIDENCE, IMPACT_USD, EVIDENCE, HYPOTHESES, EVIDENCE_COMPLETE, MISSING_EVIDENCE, NARRATIVE)
         SELECT %s, %s, %s, %s, %s, PARSE_JSON(%s), PARSE_JSON(%s), %s, %s, %s
-    """, (event["EVENT_ID"], run_id, branch, confidence, float(event.get("IMPACT_USD") or 0),
-          _v({}), _v(hypotheses), evidence_complete, missing, narrative))
+    """, (event["EVENT_ID"], run_id, branch, confidence, impact_usd,
+          _v(evidence), _v(hypotheses), evidence_complete, missing, narrative))
     _execute(conn, f"UPDATE {DATABASE}.ACTION.BUSINESS_EVENT SET STATUS = 'investigating' WHERE EVENT_ID = %s", (event["EVENT_ID"],))
 
-    return {"event_id": event["EVENT_ID"], "branch": branch, "confidence": confidence, "impact_usd": float(event.get("IMPACT_USD") or 0)}
+    return {"event_id": event["EVENT_ID"], "branch": branch, "confidence": confidence, "impact_usd": impact_usd,
+            "vendor_name": vendor_name, "narrative": narrative, "plants": plants_affected, "materials": material_groups}
 
 
 # ============================================================
@@ -241,7 +410,7 @@ def _assess_risk(conn, run_id, inv):
     evidence_complete = bool(inv.get("EVIDENCE_COMPLETE"))
     operational_score = 60 if not evidence_complete else 40
     branch = inv.get("ROOT_CAUSE_BRANCH") or "indeterminate"
-    dependency_score = 70 if branch in ("duplicate_ir", "no_goods_receipt") else 40
+    dependency_score = 70 if branch in ("duplicate_ir", "no_goods_receipt", "goods_receipt_no_invoice") else 40
 
     composite = (0.25 * severity_score + 0.20 * impact_score + 0.20 * operational_score +
                  0.15 * dependency_score + 0.10 * 50 + 0.10 * (confidence * 100))
@@ -257,9 +426,16 @@ def _assess_risk(conn, run_id, inv):
     likelihood = "high" if inv.get("SEVERITY") in ("CRITICAL", "HIGH") else "medium"
     impact_level = {"CRITICAL": "critical", "HIGH": "high", "MEDIUM": "medium", "LOW": "low"}.get(inv.get("SEVERITY", "MEDIUM"), "medium")
 
-    narrative = (f"{inv.get('HEADLINE', '')} Root cause: {branch} (confidence {confidence:.2f}). "
-                 f"Risk score {composite:.0f}/100 -> priority {priority}. Primary risk: {primary}. "
-                 f"Cascade: {' -> '.join(cascade)}.")
+    # Build contextual narrative from investigation narrative
+    inv_narrative = inv.get("NARRATIVE", "")
+    headline = inv.get("HEADLINE", "")
+    narrative = (
+        f"{headline} | Priority {priority} (score {composite:.0f}/100). "
+        f"Root cause: {branch} (confidence {confidence:.0%}). "
+        f"Primary risk category: {primary}. "
+        f"Cascade path: {' -> '.join(cascade)}. "
+        f"Financial exposure: ${impact:,.0f}. Assigned to: {owner}."
+    )
 
     _execute(conn, f"""
         INSERT INTO {DATABASE}.ACTION.RISK_ASSESSMENT
@@ -383,10 +559,182 @@ def phase_report(conn, run_id):
     # Get persona details
     personas = _query(conn, f"SELECT * FROM {DATABASE}.ACTION.PERSONA_ROUTING WHERE IS_ACTIVE ORDER BY ESCALATION_TIER")
 
+    # Get approval queue items
+    approvals = _query(conn, f"""
+        SELECT a.ACTION_TYPE, q.REQUEST_SUMMARY, q.IMPACT_USD, q.DECISION, q.REQUESTED_FROM
+        FROM {DATABASE}.ACTION.APPROVAL_QUEUE q
+        JOIN {DATABASE}.ACTION.ACTION_LOG a ON a.ACTION_ID = q.ACTION_ID
+        WHERE q.RUN_ID = %s
+    """, (run_id,))
+
     return {
         "run_id": run_id,
         "events": events_raw,
         "actions": actions_raw,
+        "approvals": approvals,
         "personas": personas,
         "timestamp": datetime.utcnow().isoformat(),
     }
+
+
+# ============================================================
+# ORCHESTRATED PIPELINE WITH CASE CREATION
+# ============================================================
+
+def run_full_pipeline_with_cases(conn, run_id, progress_callback=None, limit=20):
+    """Run all 5 phases and create AI_PROCUREMENT_CASE entries for each finding."""
+    from services.case_manager import create_case, update_case_status, audit_log, get_case_by_event
+
+    results = {"phases": {}, "cases_created": 0, "errors": []}
+
+    # Check if events already exist — skip detection if so (fast path for demo)
+    existing_count = _query(conn, f"SELECT COUNT(*) AS C FROM {DATABASE}.ACTION.BUSINESS_EVENT")
+    has_existing_events = existing_count and int(existing_count[0].get("C", 0)) > 0
+
+    # Phase 1: Detect (skip if events already present)
+    if has_existing_events:
+        if progress_callback:
+            progress_callback("phase1_start", "Checking existing detected events...")
+            progress_callback("phase1_done", f"Using {existing_count[0]['C']} existing events (skip re-detection)")
+        results["phases"]["detect"] = {"inserted": 0, "refreshed": 0, "skipped": True}
+    else:
+        if progress_callback:
+            progress_callback("phase1_start", "Scanning 6 detector views for procurement anomalies...")
+        try:
+            detect_result = phase_detect(conn, run_id, progress_callback=lambda msg: progress_callback("phase1_detail", msg) if progress_callback else None)
+            results["phases"]["detect"] = detect_result
+            if progress_callback:
+                progress_callback("phase1_done", f"Detected {detect_result['inserted']} new events, refreshed {detect_result['refreshed']}")
+        except Exception as e:
+            results["errors"].append(f"Phase 1: {e}")
+            if progress_callback:
+                progress_callback("phase1_error", str(e))
+            return results
+
+    # Phase 2: Investigate
+    if progress_callback:
+        progress_callback("phase2_start", "Running Five-Why evidence traversal (7-hop graph walk)...")
+    try:
+        inv_results = phase_investigate(conn, run_id, limit=limit,
+                                        progress_callback=lambda msg: progress_callback("phase2_detail", msg) if progress_callback else None)
+        results["phases"]["investigate"] = inv_results
+        if progress_callback:
+            progress_callback("phase2_done", f"Investigated {len(inv_results)} events with root cause analysis")
+    except Exception as e:
+        results["errors"].append(f"Phase 2: {e}")
+        if progress_callback:
+            progress_callback("phase2_error", str(e))
+        return results
+
+    # Phase 3: Risk Assessment
+    if progress_callback:
+        progress_callback("phase3_start", "Scoring risk with cascade prediction...")
+    try:
+        risk_results = phase_risk(conn, run_id, limit=limit,
+                                  progress_callback=lambda msg: progress_callback("phase3_detail", msg) if progress_callback else None)
+        results["phases"]["risk"] = risk_results
+        if progress_callback:
+            p1 = sum(1 for r in risk_results if r.get("priority") == "P1")
+            progress_callback("phase3_done", f"Assessed {len(risk_results)} risks ({p1} P1 critical)")
+    except Exception as e:
+        results["errors"].append(f"Phase 3: {e}")
+        if progress_callback:
+            progress_callback("phase3_error", str(e))
+        return results
+
+    # Phase 4: Action Planning
+    if progress_callback:
+        progress_callback("phase4_start", "Selecting actions from catalog, gating money-touching decisions...")
+    try:
+        plan_results = phase_plan(conn, run_id, limit=limit,
+                                  progress_callback=lambda msg: progress_callback("phase4_detail", msg) if progress_callback else None)
+        results["phases"]["plan"] = plan_results
+        if progress_callback:
+            progress_callback("phase4_done", f"Created action plans for {len(plan_results)} risks")
+    except Exception as e:
+        results["errors"].append(f"Phase 4: {e}")
+        if progress_callback:
+            progress_callback("phase4_error", str(e))
+        return results
+
+    # Phase 5: Create Cases + Audit Trail
+    if progress_callback:
+        progress_callback("phase5_start", "Creating procurement cases and audit trail...")
+    try:
+        # Query completed investigations with risk to create cases
+        case_data = _query(conn, f"""
+            SELECT e.EVENT_ID, e.EVENT_TYPE, e.ENTITY_KEY, e.SEVERITY, e.IMPACT_USD, e.HEADLINE,
+                   i.INVESTIGATION_ID, i.ROOT_CAUSE_BRANCH, i.CONFIDENCE, i.NARRATIVE,
+                   r.RISK_ID, r.RISK_SCORE, r.PRIORITY, r.RECOMMENDED_OWNER, r.NARRATIVE AS RISK_NARRATIVE,
+                   v.VENDOR_NAME, v.VENDOR_ID
+            FROM {DATABASE}.ACTION.BUSINESS_EVENT e
+            JOIN {DATABASE}.ACTION.INVESTIGATION i ON i.EVENT_ID = e.EVENT_ID AND i.RUN_ID = %s
+            JOIN {DATABASE}.ACTION.RISK_ASSESSMENT r ON r.EVENT_ID = e.EVENT_ID AND r.RUN_ID = %s
+            LEFT JOIN {DATABASE}.GOLD.DIM_VENDOR v ON v.VENDOR_ID = SPLIT_PART(e.ENTITY_KEY, '|', 1)
+            WHERE e.RUN_ID = %s
+            ORDER BY r.RISK_SCORE DESC
+            LIMIT %s
+        """, (run_id, run_id, run_id, limit))
+
+        cases_created = 0
+        for row in case_data:
+            existing = get_case_by_event(row["EVENT_ID"])
+            if existing:
+                # Update existing case
+                update_case_status(existing["CASE_ID"], "AI_INVESTIGATED",
+                                   risk_level=row["SEVERITY"],
+                                   risk_score=float(row.get("RISK_SCORE") or 0),
+                                   investigation_id=row["INVESTIGATION_ID"],
+                                   risk_id=row["RISK_ID"],
+                                   root_cause=row.get("ROOT_CAUSE_BRANCH", ""),
+                                   recommendation=_get_recommendation(row))
+                audit_log(existing["CASE_ID"], "INVESTIGATION_COMPLETED", "AI_AGENT", "Investigation Agent",
+                          f"Root cause: {row.get('ROOT_CAUSE_BRANCH')}. Score: {row.get('RISK_SCORE')}")
+            else:
+                vendor_name = row.get("VENDOR_NAME") or row.get("ENTITY_KEY", "Unknown")
+                case_id = create_case(
+                    case_type=row["EVENT_TYPE"],
+                    entity_id=row["ENTITY_KEY"],
+                    vendor_id=row.get("VENDOR_ID") or row["ENTITY_KEY"].split("|")[0],
+                    vendor_name=vendor_name,
+                    headline=row.get("HEADLINE", ""),
+                    financial_impact=float(row.get("IMPACT_USD") or 0),
+                    severity=row["SEVERITY"],
+                    event_id=row["EVENT_ID"],
+                    run_id=run_id,
+                    owner=row.get("RECOMMENDED_OWNER", "procurement_manager"),
+                )
+                update_case_status(case_id, "AI_INVESTIGATED",
+                                   risk_level=row["SEVERITY"],
+                                   risk_score=float(row.get("RISK_SCORE") or 0),
+                                   investigation_id=row["INVESTIGATION_ID"],
+                                   risk_id=row["RISK_ID"],
+                                   root_cause=row.get("ROOT_CAUSE_BRANCH", ""),
+                                   recommendation=_get_recommendation(row))
+                cases_created += 1
+
+        results["cases_created"] = cases_created
+        if progress_callback:
+            progress_callback("phase5_done", f"Created {cases_created} procurement cases with full audit trail")
+    except Exception as e:
+        results["errors"].append(f"Phase 5: {e}")
+        if progress_callback:
+            progress_callback("phase5_error", str(e))
+
+    return results
+
+
+def _get_recommendation(row):
+    """Derive recommendation text from risk data."""
+    branch = row.get("ROOT_CAUSE_BRANCH", "")
+    priority = row.get("PRIORITY", "P3")
+    impact = float(row.get("IMPACT_USD") or 0)
+    recs = {
+        "duplicate_ir": f"Place Payment Hold (${impact:,.0f}) pending duplicate invoice verification",
+        "price_variance": f"Place Payment Hold (${impact:,.0f}) and initiate vendor price reconciliation",
+        "goods_receipt_no_invoice": "Expedite invoice collection to close GR/IR gap before period close",
+        "no_goods_receipt": "Escalate to vendor for supply confirmation and payment terms review",
+        "currency_control_gap": "Block payment until currency alignment confirmed with vendor master",
+        "payment_terms_drift": "Review and realign payment terms with contracted baseline",
+    }
+    return recs.get(branch, f"Investigate and resolve {branch} ({priority})")

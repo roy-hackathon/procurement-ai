@@ -1,18 +1,16 @@
 definition_version: 2
-
 entities:
-  procurement_dashboard:
+  procurement_control_tower:
     type: streamlit
-    identifier:
-      name: PROCUREMENT_DASHBOARD
-      schema: GOLD
-      database: SAP_P2P_FINANCE_DEV
-    title: "CoCoEV ProcureIQ"
+    identifier: PROCUREMENT_CONTROL_TOWER
     query_warehouse: COMPUTE_WH
-    main_file: app.py
+    main_file: Agentic_Control_Tower.py
     pages_dir: pages/
     artifacts:
-      - config/
+      - Agentic_Control_Tower.py
+      - pages/
       - services/
       - components/
-    stage: GOLD.STREAMLIT_STAGE
+      - config/
+      - assets/
+      - .streamlit/pages.toml

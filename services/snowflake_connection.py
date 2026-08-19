@@ -61,25 +61,33 @@ def get_snowflake_connection():
         return None
 
 
-def run_query(sql, params=None):
-    """Execute a query and return results as list of dicts."""
+def _execute(sql, params=None):
+    """Internal: execute SQL and return (columns, rows) tuple."""
     conn = get_snowflake_connection()
     if conn is None:
-        return []
-    try:
-        mode = st.session_state.get("conn_mode", "connector")
-        if mode == "sis":
-            df = conn.sql(sql).to_pandas()
-            return df.to_dict("records")
+        return None, None
+    mode = st.session_state.get("conn_mode", "connector")
+    if mode == "sis":
+        df = conn.sql(sql).to_pandas()
+        return list(df.columns), df.values.tolist()
+    else:
+        cur = conn.cursor()
+        if params:
+            cur.execute(sql, params)
         else:
-            cur = conn.cursor()
-            if params:
-                cur.execute(sql, params)
-            else:
-                cur.execute(sql)
-            columns = [desc[0] for desc in cur.description]
-            rows = cur.fetchall()
-            return [dict(zip(columns, row)) for row in rows]
+            cur.execute(sql)
+        columns = [desc[0] for desc in cur.description]
+        rows = cur.fetchall()
+        return columns, rows
+
+
+def run_query(sql, params=None):
+    """Execute a query and return results as list of dicts."""
+    try:
+        columns, rows = _execute(sql, params)
+        if columns is None:
+            return []
+        return [dict(zip(columns, row)) for row in rows]
     except Exception as e:
         st.error(f"Query failed: {e}")
         return []
@@ -88,24 +96,40 @@ def run_query(sql, params=None):
 def run_query_df(sql, params=None):
     """Execute a query and return a pandas DataFrame."""
     import pandas as pd
-    conn = get_snowflake_connection()
-    if conn is None:
-        return pd.DataFrame()
     try:
-        mode = st.session_state.get("conn_mode", "connector")
-        if mode == "sis":
-            return conn.sql(sql).to_pandas()
-        else:
-            cur = conn.cursor()
-            if params:
-                cur.execute(sql, params)
-            else:
-                cur.execute(sql)
-            columns = [desc[0] for desc in cur.description]
-            rows = cur.fetchall()
-            return pd.DataFrame(rows, columns=columns)
+        columns, rows = _execute(sql, params)
+        if columns is None:
+            return pd.DataFrame()
+        return pd.DataFrame(rows, columns=columns)
     except Exception as e:
         st.error(f"Query failed: {e}")
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def run_query_cached(sql, params=None):
+    """Cached query (1 hour TTL). Use for GOLD schema / static data."""
+    try:
+        columns, rows = _execute(sql, params)
+        if columns is None:
+            return []
+        return [dict(zip(columns, row)) for row in rows]
+    except Exception as e:
+        logger.error("Cached query failed: %s", e)
+        return []
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def run_query_df_cached(sql, params=None):
+    """Cached query returning DataFrame (1 hour TTL). Use for GOLD schema / static data."""
+    import pandas as pd
+    try:
+        columns, rows = _execute(sql, params)
+        if columns is None:
+            return pd.DataFrame()
+        return pd.DataFrame(rows, columns=columns)
+    except Exception as e:
+        logger.error("Cached query failed: %s", e)
         return pd.DataFrame()
 
 
