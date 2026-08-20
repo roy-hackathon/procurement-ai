@@ -1,5 +1,5 @@
 """
-pipeline.py — Full 5-phase pipeline logic ported from the ai-business-event-detector scripts.
+pipeline.py — Full 5-phase pipeline logic (OPTIMIZED: batch SQL, no N+1 queries).
 Runs entirely via snowflake-connector-python (no CLI, no CoCo, no local files needed).
 """
 
@@ -11,14 +11,31 @@ from datetime import datetime
 DATABASE = "SAP_P2P_FINANCE_DEV"
 SYSTEMIC_VENDOR_THRESHOLD = 5
 
-# Phase 4 playbooks (from run_action_planning.py)
+ACTION_TABLES = [
+    "AI_AUDIT_LOG", "AI_PROCUREMENT_CASE", "NOTIFICATION_OUTBOX",
+    "APPROVAL_QUEUE", "ACTION_LOG", "ACTION_PLAN",
+    "RISK_ASSESSMENT", "INVESTIGATION", "BUSINESS_EVENT", "WORKFLOW_RUN",
+]
+
+
+def reset_action_schema(conn):
+    """Truncate all ACTION schema tables to start fresh."""
+    for table in ACTION_TABLES:
+        cur = conn.cursor()
+        try:
+            cur.execute(f"TRUNCATE TABLE {DATABASE}.ACTION.{table}")
+        finally:
+            cur.close()
+    return len(ACTION_TABLES)
+
+# Phase 4 playbooks
 MITIGATION_PLAYBOOK = {
     "duplicate_ir": [("payment_hold", "auto", "internal"), ("notify_persona", "auto", "email"), ("create_incident_summary", "auto", "document_store")],
     "no_goods_receipt": [("notify_persona", "auto", "email"), ("create_incident_summary", "auto", "document_store")],
     "over_delivery": [("notify_persona", "auto", "email")],
-    "price_variance": [("notify_persona", "auto", "email"), ("draft_sap_change_request", "draft_and_approve", "sap_draft"), ("create_incident_summary", "auto", "document_store")],
+    "price_variance": [("payment_hold", "draft_and_approve", "internal"), ("notify_persona", "auto", "email"), ("draft_sap_change_request", "draft_and_approve", "sap_draft"), ("create_incident_summary", "auto", "document_store")],
     "currency_control_gap": [("notify_persona", "auto", "email")],
-    "goods_receipt_no_invoice": [("notify_persona", "auto", "email")],
+    "goods_receipt_no_invoice": [("payment_hold", "draft_and_approve", "internal"), ("notify_persona", "auto", "email")],
     "payment_terms_drift": [("notify_persona", "auto", "email"), ("create_incident_summary", "auto", "document_store")],
     "indeterminate": [("notify_persona", "notify_only", "email")],
 }
@@ -63,6 +80,28 @@ OWNER_MAP = {
     "indeterminate": "controller",
 }
 
+BRANCH_FRIENDLY = {
+    "goods_receipt_no_invoice": "Uninvoiced Goods Receipt",
+    "no_goods_receipt": "Missing Goods Receipt / AP Aging",
+    "price_variance": "Vendor Price Variance / Overbilling",
+    "duplicate_ir": "Duplicate Invoice Receipt",
+    "currency_control_gap": "Currency Control Gap",
+    "payment_terms_drift": "Payment Terms Deviation",
+    "over_delivery": "Over-Delivery",
+    "indeterminate": "Indeterminate",
+}
+
+OWNER_FRIENDLY = {
+    "ap_manager": "AP Manager",
+    "ap_clerk": "AP Clerk",
+    "category_manager": "Category Manager",
+    "controller": "Financial Controller",
+    "buyer": "Buyer",
+    "procurement_head": "Head of Procurement",
+    "cfo": "CFO",
+    "plant_manager": "Plant Manager",
+}
+
 
 def _query(conn, sql, params=None):
     cur = conn.cursor()
@@ -87,7 +126,6 @@ def _v(obj):
     if obj is None:
         return '{}'
     if isinstance(obj, str):
-        # Already a JSON string — validate and return as-is
         try:
             json.loads(obj)
             return obj
@@ -106,51 +144,110 @@ def next_run_id():
 
 
 # ============================================================
-# PHASE 1: DETECTION
+# WORKFLOW_RUN tracking
 # ============================================================
 
-def phase_detect(conn, run_id, progress_callback=None):
-    detectors = _query(conn, f"SELECT * FROM {DATABASE}.ACTION.DETECTOR_REGISTRY WHERE IS_ACTIVE")
+def _start_workflow_run(conn, run_id):
+    _execute(conn, f"""
+        INSERT INTO {DATABASE}.ACTION.WORKFLOW_RUN
+        (RUN_ID, RUN_MODE, STARTED_AT, STATUS, IS_DRY_RUN)
+        SELECT %s, 'batch_ui', CURRENT_TIMESTAMP()::TEXT, 'running', 'false'
+    """, (run_id,))
+
+
+def _end_workflow_run(conn, run_id, status, results):
+    _execute(conn, f"""
+        UPDATE {DATABASE}.ACTION.WORKFLOW_RUN
+        SET ENDED_AT = CURRENT_TIMESTAMP()::TEXT, STATUS = %s,
+            EVENTS_DETECTED = %s, ACTIONS_PLANNED = %s, ACTIONS_EXECUTED = %s,
+            IMPACT_USD = %s
+        WHERE RUN_ID = %s
+    """, (status, str(results.get("events_detected", 0)),
+          str(results.get("actions_planned", 0)),
+          str(results.get("cases_created", 0)),
+          results.get("emails_sent", 0),
+          run_id))
+
+
+# ============================================================
+# PHASE 1: DETECTION (BATCH — 2 SQL per detector)
+# ============================================================
+
+def phase_detect(conn, run_id, progress_callback=None, detectors=None, period_days=None):
+    """Scan detector views and bulk-insert BUSINESS_EVENT rows (one INSERT per detector)."""
+    all_detectors = _query(conn, f"SELECT * FROM {DATABASE}.ACTION.DETECTOR_REGISTRY WHERE IS_ACTIVE")
+
+    if detectors:
+        all_detectors = [d for d in all_detectors if d["EVENT_TYPE"] in detectors]
+
     total_inserted = 0
     total_refreshed = 0
     errors = []
 
-    for det in detectors:
+    for det in all_detectors:
         det_name = det["DETECTOR_NAME"]
         view_name = f"{DATABASE}.ACTION.{det['VIEW_NAME']}"
         if progress_callback:
             progress_callback(f"Running detector: {det_name}")
         try:
-            events = _query(conn, f"SELECT * FROM {view_name}")
-            for evt in events:
-                entity_key = evt.get("ENTITY_KEY", "")
-                event_type = evt.get("EVENT_TYPE", det["EVENT_TYPE"])
-                existing = _query(conn, f"SELECT EVENT_ID FROM {DATABASE}.ACTION.BUSINESS_EVENT WHERE EVENT_TYPE = %s AND ENTITY_KEY = %s", (event_type, entity_key))
-                if existing:
-                    _execute(conn, f"UPDATE {DATABASE}.ACTION.BUSINESS_EVENT SET LAST_SEEN_AT = CURRENT_TIMESTAMP(), SEEN_COUNT = SEEN_COUNT + 1 WHERE EVENT_TYPE = %s AND ENTITY_KEY = %s", (event_type, entity_key))
-                    total_refreshed += 1
-                else:
-                    impact = float(evt.get("IMPACT_USD", 0) or 0)
-                    affected_keys = _v(evt.get("AFFECTED_KEYS", {}))
-                    _execute(conn, f"""
-                        INSERT INTO {DATABASE}.ACTION.BUSINESS_EVENT
-                        (RUN_ID, EVENT_TYPE, PATTERN_CLASS, DOMAIN_PACK, ENTITY_KEY, SEVERITY, IMPACT_USD, HEADLINE, DESCRIPTION, AFFECTED_KEYS, STATUS, DETECTED_AT, LAST_SEEN_AT, SEEN_COUNT, PERIOD_KEY)
-                        SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, PARSE_JSON(%s), 'open', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(), 1, %s
-                    """, (run_id, event_type, evt.get("PATTERN_CLASS", "threshold_breach"), det.get("DOMAIN_PACK", "finance"),
-                          entity_key, evt.get("SEVERITY", "MEDIUM"), impact, evt.get("HEADLINE", f"{det_name}: {entity_key}"),
-                          evt.get("DESCRIPTION", ""), affected_keys,
-                          datetime.utcnow().strftime("%Y-%m")))
-                    total_inserted += 1
+            limit_clause = "ORDER BY IMPACT_USD DESC LIMIT 50" if period_days else ""
+
+            # Batch INSERT — one SQL inserts all new events from detector view
+            inserted = _execute(conn, f"""
+                INSERT INTO {DATABASE}.ACTION.BUSINESS_EVENT
+                (RUN_ID, EVENT_TYPE, PATTERN_CLASS, DOMAIN_PACK, ENTITY_KEY, SEVERITY, IMPACT_USD,
+                 HEADLINE, DESCRIPTION, AFFECTED_KEYS, STATUS, DETECTED_AT, LAST_SEEN_AT, SEEN_COUNT, PERIOD_KEY)
+                SELECT '{run_id}', d.EVENT_TYPE, 
+                       COALESCE(d.PATTERN_CLASS, 'threshold_breach'),
+                       COALESCE(d.DOMAIN_PACK, '{det.get("DOMAIN_PACK", "finance")}'),
+                       d.ENTITY_KEY, 
+                       COALESCE(d.SEVERITY, 'MEDIUM'),
+                       COALESCE(d.IMPACT_USD, 0),
+                       COALESCE(d.HEADLINE, '{det_name}: ' || d.ENTITY_KEY),
+                       COALESCE(d.DESCRIPTION, ''),
+                       COALESCE(TO_VARCHAR(d.AFFECTED_KEYS), '{{}}'),
+                       'open', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(), 1,
+                       '{datetime.utcnow().strftime("%Y-%m")}'
+                FROM ({f"SELECT * FROM {view_name} {limit_clause}"}) d
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM {DATABASE}.ACTION.BUSINESS_EVENT e
+                    WHERE e.EVENT_TYPE = d.EVENT_TYPE AND e.ENTITY_KEY = d.ENTITY_KEY
+                )
+            """)
+            total_inserted += inserted
+
+            # Batch UPDATE — refresh seen_count for all existing events
+            refreshed = _execute(conn, f"""
+                UPDATE {DATABASE}.ACTION.BUSINESS_EVENT e
+                SET LAST_SEEN_AT = CURRENT_TIMESTAMP(), SEEN_COUNT = SEEN_COUNT + 1
+                WHERE EXISTS (
+                    SELECT 1 FROM {view_name} d
+                    WHERE d.EVENT_TYPE = e.EVENT_TYPE AND d.ENTITY_KEY = e.ENTITY_KEY
+                ) AND e.RUN_ID != '{run_id}'
+            """)
+            total_refreshed += refreshed
         except Exception as e:
             errors.append(f"{det_name}: {e}")
             if progress_callback:
                 progress_callback(f"  Error: {det_name}: {e}")
 
-    return {"inserted": total_inserted, "refreshed": total_refreshed, "detectors": len(detectors), "errors": errors}
+    # Assign EVENT_IDs to new rows that have NULL (auto-increment may not be set up)
+    _execute(conn, f"""
+        MERGE INTO {DATABASE}.ACTION.BUSINESS_EVENT t
+        USING (
+            SELECT ENTITY_KEY, EVENT_TYPE,
+                   ROW_NUMBER() OVER (ORDER BY IMPACT_USD DESC) +
+                   COALESCE((SELECT MAX(EVENT_ID) FROM {DATABASE}.ACTION.BUSINESS_EVENT WHERE EVENT_ID IS NOT NULL), 0) AS NEW_ID
+            FROM {DATABASE}.ACTION.BUSINESS_EVENT WHERE EVENT_ID IS NULL AND RUN_ID = '{run_id}'
+        ) s ON t.ENTITY_KEY = s.ENTITY_KEY AND t.EVENT_TYPE = s.EVENT_TYPE AND t.RUN_ID = '{run_id}' AND t.EVENT_ID IS NULL
+        WHEN MATCHED THEN UPDATE SET EVENT_ID = s.NEW_ID
+    """)
+
+    return {"inserted": total_inserted, "refreshed": total_refreshed, "detectors": len(all_detectors), "errors": errors}
 
 
 # ============================================================
-# PHASE 2: INVESTIGATION
+# PHASE 2: INVESTIGATION (BATCH evidence fetch)
 # ============================================================
 
 def phase_investigate(conn, run_id, limit=50, progress_callback=None):
@@ -161,104 +258,174 @@ def phase_investigate(conn, run_id, limit=50, progress_callback=None):
         ORDER BY ABS(e.IMPACT_USD) DESC LIMIT %s
     """, (limit,))
 
+    if not events:
+        return []
+
+    # Pre-fetch ALL vendor evidence in bulk (one query per hop type)
+    vendor_ids = list(set(
+        e["ENTITY_KEY"].split("|")[0] if "|" in e.get("ENTITY_KEY", "") else e.get("ENTITY_KEY", "")
+        for e in events
+    ))
+    vendor_list = ",".join(f"'{v}'" for v in vendor_ids)
+
+    if progress_callback:
+        progress_callback(f"Pre-fetching evidence for {len(vendor_ids)} vendors (batch)...")
+
+    # Bulk evidence queries
+    evidence_cache = {}
+    try:
+        # Hop 1: PO stats per vendor
+        po_stats = _query(conn, f"""
+            SELECT v.VENDOR_ID, COUNT(*) AS PO_COUNT, COALESCE(SUM(po.GROSS_VALUE), 0) AS TOTAL_PO_VALUE,
+                   COALESCE(AVG(po.GROSS_VALUE), 0) AS AVG_PO_VALUE
+            FROM {DATABASE}.GOLD.FCT_PURCHASE_ORDERS po
+            JOIN {DATABASE}.GOLD.DIM_VENDOR v ON v.VENDOR_SK = po.VENDOR_SK
+            WHERE v.VENDOR_ID IN ({vendor_list})
+            GROUP BY v.VENDOR_ID
+        """)
+        for r in po_stats:
+            evidence_cache.setdefault(r["VENDOR_ID"], {})["hop1_po"] = r
+
+        # Hop 2: GR vs IR
+        gr_ir = _query(conn, f"""
+            SELECT v.VENDOR_ID, h.EVENT_TYPE, COUNT(*) AS CNT, COALESCE(SUM(h.AMOUNT_LOCAL_CURRENCY), 0) AS TOTAL_VALUE
+            FROM {DATABASE}.GOLD.FCT_PO_HISTORY h
+            JOIN {DATABASE}.GOLD.FCT_PURCHASE_ORDERS po ON po.PO_ID = h.PO_ID AND po.PO_LINE = h.PO_LINE
+            JOIN {DATABASE}.GOLD.DIM_VENDOR v ON v.VENDOR_SK = po.VENDOR_SK
+            WHERE v.VENDOR_ID IN ({vendor_list})
+            GROUP BY v.VENDOR_ID, h.EVENT_TYPE
+        """)
+        for r in gr_ir:
+            vid = r["VENDOR_ID"]
+            evidence_cache.setdefault(vid, {}).setdefault("hop2_gr_ir_raw", []).append(r)
+
+        # Hop 3: Invoice stats
+        inv_stats = _query(conn, f"""
+            SELECT v.VENDOR_ID, COUNT(*) AS INV_COUNT, COALESCE(SUM(i.GROSS_INVOICE_AMOUNT), 0) AS TOTAL_INVOICED,
+                   COALESCE(AVG(i.GROSS_INVOICE_AMOUNT), 0) AS AVG_INVOICE
+            FROM {DATABASE}.GOLD.FCT_AP_INVOICES i
+            JOIN {DATABASE}.GOLD.DIM_VENDOR v ON v.VENDOR_SK = i.VENDOR_SK
+            WHERE v.VENDOR_ID IN ({vendor_list})
+            GROUP BY v.VENDOR_ID
+        """)
+        for r in inv_stats:
+            evidence_cache.setdefault(r["VENDOR_ID"], {})["hop3_invoices"] = r
+
+        # Hop 4: Materials and plants
+        mat_plant = _query(conn, f"""
+            SELECT v.VENDOR_ID, m.MATERIAL_GROUP, p.PLANT_NAME, COUNT(*) AS PO_LINES
+            FROM {DATABASE}.GOLD.FCT_PURCHASE_ORDERS po
+            JOIN {DATABASE}.GOLD.DIM_VENDOR v ON v.VENDOR_SK = po.VENDOR_SK
+            JOIN {DATABASE}.GOLD.DIM_MATERIAL m ON m.MATERIAL_SK = po.MATERIAL_SK
+            JOIN {DATABASE}.GOLD.DIM_PLANT p ON p.PLANT_SK = po.PLANT_SK
+            WHERE v.VENDOR_ID IN ({vendor_list})
+            GROUP BY v.VENDOR_ID, m.MATERIAL_GROUP, p.PLANT_NAME
+            ORDER BY PO_LINES DESC
+        """)
+        for r in mat_plant:
+            evidence_cache.setdefault(r["VENDOR_ID"], {}).setdefault("hop4_materials_plants", []).append(r)
+
+        # Hop 5: AP open items
+        ap_items = _query(conn, f"""
+            SELECT v.VENDOR_ID, COUNT(*) AS OPEN_ITEMS, COALESCE(SUM(a.AMOUNT_LOCAL_CURRENCY), 0) AS TOTAL_OPEN
+            FROM {DATABASE}.GOLD.FCT_AP_OPEN_ITEMS a
+            JOIN {DATABASE}.GOLD.DIM_VENDOR v ON v.VENDOR_SK = a.VENDOR_SK
+            WHERE v.VENDOR_ID IN ({vendor_list})
+            GROUP BY v.VENDOR_ID
+        """)
+        for r in ap_items:
+            evidence_cache.setdefault(r["VENDOR_ID"], {})["hop5_ap_open"] = r
+
+        # Hop 6: Vendor names
+        vendor_info = _query(conn, f"""
+            SELECT VENDOR_ID, VENDOR_NAME, COUNTRY FROM {DATABASE}.GOLD.DIM_VENDOR
+            WHERE VENDOR_ID IN ({vendor_list})
+        """)
+        for r in vendor_info:
+            evidence_cache.setdefault(r["VENDOR_ID"], {})["vendor_info"] = r
+
+    except Exception as e:
+        if progress_callback:
+            progress_callback(f"  Evidence pre-fetch warning: {e}")
+
+    # Now process each event using cached evidence (no more per-event queries)
     results = []
+    inv_inserts = []  # collect for batch insert
+
     for event in events:
         if progress_callback:
             progress_callback(f"Investigating: {event.get('HEADLINE', event['EVENT_TYPE'])[:60]}")
         try:
-            result = _investigate_event(conn, run_id, event)
+            result = _investigate_event_cached(conn, run_id, event, evidence_cache)
             results.append(result)
+            inv_inserts.append(result)
         except Exception as e:
             results.append({"event_id": event["EVENT_ID"], "branch": "error", "confidence": 0, "error": str(e)})
+
+    # Batch update event statuses
+    if inv_inserts:
+        event_ids = [str(r["event_id"]) for r in inv_inserts if r.get("event_id")]
+        if event_ids:
+            _execute(conn, f"""
+                UPDATE {DATABASE}.ACTION.BUSINESS_EVENT
+                SET STATUS = 'investigating'
+                WHERE EVENT_ID IN ({','.join(event_ids)})
+            """)
+
     return results
 
 
-def _investigate_event(conn, run_id, event):
+def _investigate_event_cached(conn, run_id, event, evidence_cache):
+    """Investigate using pre-fetched evidence cache (no additional queries)."""
     etype = event["EVENT_TYPE"]
     entity_key = event["ENTITY_KEY"]
     impact_usd = float(event.get("IMPACT_USD") or 0)
-
-    # --- 7-hop evidence traversal (actual SQL queries) ---
-    evidence = {}
     vendor_id = entity_key.split("|")[0] if "|" in entity_key else entity_key
 
-    # Hop 1: Vendor PO summary
-    po_stats = _query(conn, f"""
-        SELECT COUNT(*) AS PO_COUNT, COALESCE(SUM(GROSS_VALUE), 0) AS TOTAL_PO_VALUE,
-               COALESCE(AVG(GROSS_VALUE), 0) AS AVG_PO_VALUE
-        FROM {DATABASE}.GOLD.FCT_PURCHASE_ORDERS
-        WHERE VENDOR_SK IN (SELECT VENDOR_SK FROM {DATABASE}.GOLD.DIM_VENDOR WHERE VENDOR_ID = %s)
-    """, (vendor_id,))
-    if po_stats:
-        evidence["hop1_po"] = po_stats[0]
+    # Pull from cache
+    vendor_evidence = evidence_cache.get(vendor_id, {})
+    evidence = {}
 
-    # Hop 2: GR vs IR from PO History
-    gr_ir = _query(conn, f"""
-        SELECT h.EVENT_TYPE, COUNT(*) AS CNT, COALESCE(SUM(h.AMOUNT_LOCAL_CURRENCY), 0) AS TOTAL_VALUE
-        FROM {DATABASE}.GOLD.FCT_PO_HISTORY h
-        JOIN {DATABASE}.GOLD.FCT_PURCHASE_ORDERS po ON po.PO_ID = h.PO_ID AND po.PO_LINE = h.PO_LINE
-        WHERE po.VENDOR_SK IN (SELECT VENDOR_SK FROM {DATABASE}.GOLD.DIM_VENDOR WHERE VENDOR_ID = %s)
-        GROUP BY h.EVENT_TYPE
-    """, (vendor_id,))
-    gr_value = sum(float(r["TOTAL_VALUE"]) for r in gr_ir if r["EVENT_TYPE"] == 1)
-    ir_value = sum(float(r["TOTAL_VALUE"]) for r in gr_ir if r["EVENT_TYPE"] == 2)
-    gr_count = sum(int(r["CNT"]) for r in gr_ir if r["EVENT_TYPE"] == 1)
-    ir_count = sum(int(r["CNT"]) for r in gr_ir if r["EVENT_TYPE"] == 2)
+    po_data = vendor_evidence.get("hop1_po", {})
+    evidence["hop1_po"] = po_data
+
+    # Parse GR/IR from raw
+    gr_ir_raw = vendor_evidence.get("hop2_gr_ir_raw", [])
+    gr_value = sum(float(r["TOTAL_VALUE"]) for r in gr_ir_raw if r["EVENT_TYPE"] == 1)
+    ir_value = sum(float(r["TOTAL_VALUE"]) for r in gr_ir_raw if r["EVENT_TYPE"] == 2)
+    gr_count = sum(int(r["CNT"]) for r in gr_ir_raw if r["EVENT_TYPE"] == 1)
+    ir_count = sum(int(r["CNT"]) for r in gr_ir_raw if r["EVENT_TYPE"] == 2)
     evidence["hop2_gr_ir"] = {"gr_value": gr_value, "ir_value": ir_value, "gr_count": gr_count, "ir_count": ir_count}
 
-    # Hop 3: Invoice totals
-    inv_stats = _query(conn, f"""
-        SELECT COUNT(*) AS INV_COUNT, COALESCE(SUM(GROSS_INVOICE_AMOUNT), 0) AS TOTAL_INVOICED,
-               COALESCE(AVG(GROSS_INVOICE_AMOUNT), 0) AS AVG_INVOICE
-        FROM {DATABASE}.GOLD.FCT_AP_INVOICES
-        WHERE VENDOR_SK IN (SELECT VENDOR_SK FROM {DATABASE}.GOLD.DIM_VENDOR WHERE VENDOR_ID = %s)
-    """, (vendor_id,))
-    if inv_stats:
-        evidence["hop3_invoices"] = inv_stats[0]
+    inv_data = vendor_evidence.get("hop3_invoices", {})
+    evidence["hop3_invoices"] = inv_data
 
-    # Hop 4: Materials and plants affected
-    mat_plant = _query(conn, f"""
-        SELECT m.MATERIAL_GROUP, p.PLANT_NAME, COUNT(*) AS PO_LINES
-        FROM {DATABASE}.GOLD.FCT_PURCHASE_ORDERS po
-        JOIN {DATABASE}.GOLD.DIM_MATERIAL m ON m.MATERIAL_SK = po.MATERIAL_SK
-        JOIN {DATABASE}.GOLD.DIM_PLANT p ON p.PLANT_SK = po.PLANT_SK
-        WHERE po.VENDOR_SK IN (SELECT VENDOR_SK FROM {DATABASE}.GOLD.DIM_VENDOR WHERE VENDOR_ID = %s)
-        GROUP BY m.MATERIAL_GROUP, p.PLANT_NAME
-        ORDER BY PO_LINES DESC LIMIT 10
-    """, (vendor_id,))
+    mat_plant = vendor_evidence.get("hop4_materials_plants", [])
     evidence["hop4_materials_plants"] = mat_plant
-    material_groups = list(set(r["MATERIAL_GROUP"] for r in mat_plant))
-    plants_affected = list(set(r["PLANT_NAME"] for r in mat_plant))
+    material_groups = list(set(r["MATERIAL_GROUP"] for r in mat_plant if r.get("MATERIAL_GROUP")))
+    plants_affected = list(set(r["PLANT_NAME"] for r in mat_plant if r.get("PLANT_NAME")))
 
-    # Hop 5: AP open items
-    ap_items = _query(conn, f"""
-        SELECT COUNT(*) AS OPEN_ITEMS, COALESCE(SUM(AMOUNT_LOCAL_CURRENCY), 0) AS TOTAL_OPEN
-        FROM {DATABASE}.GOLD.FCT_AP_OPEN_ITEMS
-        WHERE VENDOR_SK IN (SELECT VENDOR_SK FROM {DATABASE}.GOLD.DIM_VENDOR WHERE VENDOR_ID = %s)
-    """, (vendor_id,))
-    if ap_items:
-        evidence["hop5_ap_open"] = ap_items[0]
+    ap_data = vendor_evidence.get("hop5_ap_open", {})
+    evidence["hop5_ap_open"] = ap_data
 
-    # Hop 6: Vendor name lookup
-    vendor_info = _query(conn, f"SELECT VENDOR_NAME, COUNTRY FROM {DATABASE}.GOLD.DIM_VENDOR WHERE VENDOR_ID = %s", (vendor_id,))
-    vendor_name = vendor_info[0]["VENDOR_NAME"] if vendor_info else vendor_id
-    vendor_country = vendor_info[0].get("COUNTRY", "?") if vendor_info else "?"
+    vinfo = vendor_evidence.get("vendor_info", {})
+    vendor_name = vinfo.get("VENDOR_NAME", vendor_id)
+    vendor_country = vinfo.get("COUNTRY", "?")
 
-    # --- Determine root cause from evidence ---
+    # Determine root cause
     branch = "indeterminate"
     confidence = 0.30
     hypotheses = []
     evidence_complete = True
     missing = None
 
-    po_total = float(evidence.get("hop1_po", {}).get("TOTAL_PO_VALUE", 0) or 0)
-    inv_total = float(evidence.get("hop3_invoices", {}).get("TOTAL_INVOICED", 0) or 0)
-    avg_po = float(evidence.get("hop1_po", {}).get("AVG_PO_VALUE", 0) or 0)
-    avg_inv = float(evidence.get("hop3_invoices", {}).get("AVG_INVOICE", 0) or 0)
-    ap_open_total = float(evidence.get("hop5_ap_open", {}).get("TOTAL_OPEN", 0) or 0)
+    po_total = float(po_data.get("TOTAL_PO_VALUE", 0) or 0)
+    inv_total = float(inv_data.get("TOTAL_INVOICED", 0) or 0)
+    avg_po = float(po_data.get("AVG_PO_VALUE", 0) or 0)
+    avg_inv = float(inv_data.get("AVG_INVOICE", 0) or 0)
+    ap_open_total = float(ap_data.get("TOTAL_OPEN", 0) or 0)
 
     if etype == "invoice_over_po":
-        # Key signal: does GR exceed IR? If yes, vendor has NOT overbilled
         if gr_value > ir_value:
             uninvoiced_gap = gr_value - ir_value
             branch = "goods_receipt_no_invoice"
@@ -267,7 +434,7 @@ def _investigate_event(conn, run_id, event):
                 {"branch": "goods_receipt_no_invoice", "score": 0.85,
                  "reason": f"GR value (${gr_value:,.0f}) EXCEEDS IR value (${ir_value:,.0f}). Vendor has NOT overbilled. Real risk: ${uninvoiced_gap:,.0f} in uninvoiced goods."},
                 {"branch": "price_variance", "score": 0.25,
-                 "reason": f"Apparent overbilling is aggregation mismatch: avg PO ${avg_po:,.0f} (unit) vs avg invoice ${avg_inv:,.0f} (batch). Cannot confirm line-level price inflation."},
+                 "reason": f"Apparent overbilling is aggregation mismatch: avg PO ${avg_po:,.0f} (unit) vs avg invoice ${avg_inv:,.0f} (batch)."},
                 {"branch": "duplicate_ir", "score": 0.10,
                  "reason": "Cannot rule out without line-level PO-to-invoice matching (PO_ID on invoices is NULL)."},
             ]
@@ -335,7 +502,7 @@ def _investigate_event(conn, run_id, event):
         narrative = (
             f"Five-Why Investigation for {vendor_name} ({vendor_country}):\n"
             f"1. Why is this AP item open? Payable of ${impact_usd:,.0f} remains unpaid beyond agreed terms.\n"
-            f"2. Is this isolated? Vendor has {int(evidence.get('hop5_ap_open', {}).get('OPEN_ITEMS', 0) or 0)} open items "
+            f"2. Is this isolated? Vendor has {int(ap_data.get('OPEN_ITEMS', 0) or 0)} open items "
             f"totaling ${ap_open_total:,.0f}.\n"
             f"3. What is the vendor's importance? Supplies {len(material_groups)} material groups across {len(plants_affected)} plants.\n"
             f"4. What is the risk? Vendor relationship deterioration, potential supply withholding.\n"
@@ -373,9 +540,21 @@ def _investigate_event(conn, run_id, event):
         SELECT %s, %s, %s, %s, %s, PARSE_JSON(%s), PARSE_JSON(%s), %s, %s, %s
     """, (event["EVENT_ID"], run_id, branch, confidence, impact_usd,
           _v(evidence), _v(hypotheses), evidence_complete, missing, narrative))
-    _execute(conn, f"UPDATE {DATABASE}.ACTION.BUSINESS_EVENT SET STATUS = 'investigating' WHERE EVENT_ID = %s", (event["EVENT_ID"],))
 
-    return {"event_id": event["EVENT_ID"], "branch": branch, "confidence": confidence, "impact_usd": impact_usd,
+    # Assign INVESTIGATION_ID if NULL (no auto-increment on this account)
+    _execute(conn, f"""
+        UPDATE {DATABASE}.ACTION.INVESTIGATION
+        SET INVESTIGATION_ID = (
+            SELECT COALESCE(MAX(INVESTIGATION_ID), 0) FROM {DATABASE}.ACTION.INVESTIGATION WHERE INVESTIGATION_ID IS NOT NULL
+        ) + 1
+        WHERE EVENT_ID = %s AND RUN_ID = %s AND INVESTIGATION_ID IS NULL
+    """, (event["EVENT_ID"], run_id))
+
+    # Fetch the assigned ID
+    inv_id_row = _query(conn, f"SELECT INVESTIGATION_ID FROM {DATABASE}.ACTION.INVESTIGATION WHERE EVENT_ID = %s AND RUN_ID = %s", (event["EVENT_ID"], run_id))
+    inv_id = inv_id_row[0]["INVESTIGATION_ID"] if inv_id_row else None
+
+    return {"event_id": event["EVENT_ID"], "investigation_id": inv_id, "branch": branch, "confidence": confidence, "impact_usd": impact_usd,
             "vendor_name": vendor_name, "narrative": narrative, "plants": plants_affected, "materials": material_groups}
 
 
@@ -399,6 +578,17 @@ def phase_risk(conn, run_id, limit=50, progress_callback=None):
             progress_callback(f"Assessing risk: {inv.get('HEADLINE', '')[:60]}")
         result = _assess_risk(conn, run_id, inv)
         results.append(result)
+
+    # Batch update event statuses
+    if results:
+        event_ids = [str(r["event_id"]) for r in results if r.get("event_id")]
+        if event_ids:
+            _execute(conn, f"""
+                UPDATE {DATABASE}.ACTION.BUSINESS_EVENT
+                SET STATUS = 'risk_assessed'
+                WHERE EVENT_ID IN ({','.join(event_ids)})
+            """)
+
     return results
 
 
@@ -426,8 +616,6 @@ def _assess_risk(conn, run_id, inv):
     likelihood = "high" if inv.get("SEVERITY") in ("CRITICAL", "HIGH") else "medium"
     impact_level = {"CRITICAL": "critical", "HIGH": "high", "MEDIUM": "medium", "LOW": "low"}.get(inv.get("SEVERITY", "MEDIUM"), "medium")
 
-    # Build contextual narrative from investigation narrative
-    inv_narrative = inv.get("NARRATIVE", "")
     headline = inv.get("HEADLINE", "")
     narrative = (
         f"{headline} | Priority {priority} (score {composite:.0f}/100). "
@@ -445,13 +633,21 @@ def _assess_risk(conn, run_id, inv):
         SELECT %s, %s, %s, %s, %s, %s, PARSE_JSON(%s), %s, %s, %s, PARSE_JSON(%s), %s, %s
     """, (inv["EVENT_ID"], inv["INVESTIGATION_ID"], run_id, round(composite, 2), priority, primary,
           _v(secondary), likelihood, impact_level, impact, _v(cascade), owner, narrative))
-    _execute(conn, f"UPDATE {DATABASE}.ACTION.BUSINESS_EVENT SET STATUS = 'risk_assessed' WHERE EVENT_ID = %s", (inv["EVENT_ID"],))
+
+    # Assign RISK_ID if NULL
+    _execute(conn, f"""
+        UPDATE {DATABASE}.ACTION.RISK_ASSESSMENT
+        SET RISK_ID = (
+            SELECT COALESCE(MAX(RISK_ID), 0) FROM {DATABASE}.ACTION.RISK_ASSESSMENT WHERE RISK_ID IS NOT NULL
+        ) + 1
+        WHERE EVENT_ID = %s AND RUN_ID = %s AND RISK_ID IS NULL
+    """, (inv["EVENT_ID"], run_id))
 
     return {"event_id": inv["EVENT_ID"], "priority": priority, "score": round(composite, 2), "owner": owner, "impact_usd": impact}
 
 
 # ============================================================
-# PHASE 4: ACTION PLANNING
+# PHASE 4: ACTION PLANNING (with PAYMENT_HOLD, APPROVAL_QUEUE, SAP_CHANGE_REQUEST)
 # ============================================================
 
 def phase_plan(conn, run_id, limit=50, progress_callback=None):
@@ -470,6 +666,17 @@ def phase_plan(conn, run_id, limit=50, progress_callback=None):
             progress_callback(f"Planning actions for {risk.get('RECOMMENDED_OWNER', 'unknown')} (P{risk.get('PRIORITY', '?')})")
         result = _plan_for_risk(conn, run_id, risk)
         results.append(result)
+
+    # Batch update event statuses
+    if results:
+        event_ids = [str(r["event_id"]) for r in results if r.get("event_id")]
+        if event_ids:
+            _execute(conn, f"""
+                UPDATE {DATABASE}.ACTION.BUSINESS_EVENT
+                SET STATUS = 'planned'
+                WHERE EVENT_ID IN ({','.join(event_ids)})
+            """)
+
     return results
 
 
@@ -484,8 +691,7 @@ def _plan_for_risk(conn, run_id, risk):
     if priority in ("P1", "P2") and branch in PREVENTION_PLAYBOOK:
         _create_plan(conn, run_id, risk, "prevention", PREVENTION_PLAYBOOK[branch], "this_month")
 
-    _execute(conn, f"UPDATE {DATABASE}.ACTION.BUSINESS_EVENT SET STATUS = 'planned' WHERE EVENT_ID = %s", (risk["EVENT_ID"],))
-    return {"risk_id": risk["RISK_ID"], "priority": priority, "branch": branch, "owner": risk.get("RECOMMENDED_OWNER")}
+    return {"risk_id": risk["RISK_ID"], "event_id": risk["EVENT_ID"], "priority": priority, "branch": branch, "owner": risk.get("RECOMMENDED_OWNER")}
 
 
 def _create_plan(conn, run_id, risk, plan_type, steps, window):
@@ -495,8 +701,17 @@ def _create_plan(conn, run_id, risk, plan_type, steps, window):
     """, (risk["RISK_ID"], run_id, plan_type, window, risk.get("RECOMMENDED_OWNER", "controller"),
           70.0 if plan_type == "mitigation" else 30.0))
 
-    plan_rows = _query(conn, f"SELECT PLAN_ID FROM {DATABASE}.ACTION.ACTION_PLAN WHERE RISK_ID = %s AND PLAN_TYPE = %s ORDER BY PLAN_ID DESC LIMIT 1", (risk["RISK_ID"], plan_type))
-    if not plan_rows:
+    # Assign PLAN_ID if NULL
+    _execute(conn, f"""
+        UPDATE {DATABASE}.ACTION.ACTION_PLAN
+        SET PLAN_ID = (
+            SELECT COALESCE(MAX(PLAN_ID), 0) FROM {DATABASE}.ACTION.ACTION_PLAN WHERE PLAN_ID IS NOT NULL
+        ) + 1
+        WHERE RISK_ID = %s AND PLAN_TYPE = %s AND RUN_ID = %s AND PLAN_ID IS NULL
+    """, (risk["RISK_ID"], plan_type, run_id))
+
+    plan_rows = _query(conn, f"SELECT PLAN_ID FROM {DATABASE}.ACTION.ACTION_PLAN WHERE RISK_ID = %s AND PLAN_TYPE = %s AND RUN_ID = %s ORDER BY PLAN_ID DESC LIMIT 1", (risk["RISK_ID"], plan_type, run_id))
+    if not plan_rows or not plan_rows[0]["PLAN_ID"]:
         return
     plan_id = plan_rows[0]["PLAN_ID"]
 
@@ -514,6 +729,7 @@ def _create_plan(conn, run_id, risk, plan_type, steps, window):
         """, (plan_id, run_id, action_type, seq, autonomy, target, risk.get("RECOMMENDED_OWNER", "controller"),
               key, _v(payload), initial_status, float(risk.get("FINANCIAL_IMPACT_USD") or 0), 1))
 
+        # Populate APPROVAL_QUEUE for draft_and_approve actions
         if autonomy == "draft_and_approve":
             action_rows = _query(conn, f"SELECT ACTION_ID FROM {DATABASE}.ACTION.ACTION_LOG WHERE IDEMPOTENCY_KEY = %s", (key,))
             if action_rows:
@@ -524,13 +740,44 @@ def _create_plan(conn, run_id, risk, plan_type, steps, window):
                       f"{action_type} for {risk.get('ROOT_CAUSE_BRANCH')} ({risk.get('PRIORITY')})",
                       float(risk.get("FINANCIAL_IMPACT_USD") or 0)))
 
+        # Populate PAYMENT_HOLD for payment_hold actions
+        if action_type == "payment_hold":
+            entity_key = risk.get("ENTITY_KEY", "")
+            vendor_id = entity_key.split("|")[0] if "|" in entity_key else entity_key
+            action_id_rows = _query(conn, f"SELECT ACTION_ID FROM {DATABASE}.ACTION.ACTION_LOG WHERE IDEMPOTENCY_KEY = %s", (key,))
+            hold_action_id = action_id_rows[0]["ACTION_ID"] if action_id_rows else None
+            _execute(conn, f"""
+                INSERT INTO {DATABASE}.ACTION.PAYMENT_HOLD
+                (VENDOR_ID, HOLD_AMOUNT_USD, REASON_CODE, REASON_TEXT, PLACED_BY_ACTION_ID, PLACED_AT, IS_ACTIVE)
+                SELECT %s, %s, %s, %s, %s, CURRENT_TIMESTAMP()::TEXT, %s
+            """, (vendor_id,
+                  str(float(risk.get("FINANCIAL_IMPACT_USD") or 0)),
+                  risk.get("ROOT_CAUSE_BRANCH", "unknown"),
+                  f"Auto-hold: {risk.get('ROOT_CAUSE_BRANCH')} ({risk.get('PRIORITY')})",
+                  str(hold_action_id) if hold_action_id else None,
+                  "true" if autonomy == "auto" else "false"))
+
+        # Populate SAP_CHANGE_REQUEST for sap draft actions
+        if action_type == "draft_sap_change_request":
+            sap_action_rows = _query(conn, f"SELECT ACTION_ID FROM {DATABASE}.ACTION.ACTION_LOG WHERE IDEMPOTENCY_KEY = %s", (key,))
+            sap_action_id = sap_action_rows[0]["ACTION_ID"] if sap_action_rows else None
+            _execute(conn, f"""
+                INSERT INTO {DATABASE}.ACTION.SAP_CHANGE_REQUEST
+                (ACTION_ID, RUN_ID, SAP_OBJECT, SAP_TRANSACTION, PAYLOAD, STATUS, NOTES)
+                SELECT %s, %s, %s, %s, PARSE_JSON(%s), %s, %s
+            """, (str(sap_action_id) if sap_action_id else None, run_id,
+                  "VENDOR_MASTER", "XK02",
+                  _v({"branch": risk.get("ROOT_CAUSE_BRANCH"), "entity_key": risk.get("ENTITY_KEY"), "priority": risk.get("PRIORITY")}),
+                  "draft",
+                  f"Price correction for {risk.get('ROOT_CAUSE_BRANCH')}: {risk.get('ENTITY_KEY', '')}"))
+
 
 # ============================================================
-# PHASE 5: REPORT GENERATION (in-memory HTML)
+# PHASE 5: CASE CREATION + NOTIFICATION_OUTBOX
 # ============================================================
 
 def phase_report(conn, run_id):
-    """Build report data from ACTION tables and return HTML string."""
+    """Build report data from ACTION tables and return dict."""
     events_raw = _query(conn, f"""
         SELECT e.EVENT_ID, e.EVENT_TYPE, e.ENTITY_KEY, e.SEVERITY, e.IMPACT_USD,
                e.HEADLINE, e.DESCRIPTION, e.STATUS,
@@ -544,7 +791,6 @@ def phase_report(conn, run_id):
         LIMIT 50
     """, (run_id,))
 
-    # Get actions grouped by persona
     actions_raw = _query(conn, f"""
         SELECT a.ACTION_TYPE, a.OWNER_PERSONA, a.STATUS, a.AUTONOMY_LEVEL, a.IMPACT_USD,
                r.PRIORITY, r.EVENT_ID, e.HEADLINE
@@ -556,10 +802,8 @@ def phase_report(conn, run_id):
         ORDER BY a.OWNER_PERSONA, a.ACTION_SEQ
     """, (run_id,))
 
-    # Get persona details
     personas = _query(conn, f"SELECT * FROM {DATABASE}.ACTION.PERSONA_ROUTING WHERE IS_ACTIVE ORDER BY ESCALATION_TIER")
 
-    # Get approval queue items
     approvals = _query(conn, f"""
         SELECT a.ACTION_TYPE, q.REQUEST_SUMMARY, q.IMPACT_USD, q.DECISION, q.REQUESTED_FROM
         FROM {DATABASE}.ACTION.APPROVAL_QUEUE q
@@ -581,27 +825,36 @@ def phase_report(conn, run_id):
 # ORCHESTRATED PIPELINE WITH CASE CREATION
 # ============================================================
 
-def run_full_pipeline_with_cases(conn, run_id, progress_callback=None, limit=20):
-    """Run all 5 phases and create AI_PROCUREMENT_CASE entries for each finding."""
+def run_full_pipeline_with_cases(conn, run_id, progress_callback=None, limit=20, detectors=None, period_days=None):
+    """Run all 5 phases and create AI_PROCUREMENT_CASE entries (batch optimized)."""
     from services.case_manager import create_case, update_case_status, audit_log, get_case_by_event
 
-    results = {"phases": {}, "cases_created": 0, "errors": []}
+    results = {"phases": {}, "cases_created": 0, "errors": [], "emails_sent": 0}
+
+    # Log workflow run start
+    try:
+        _start_workflow_run(conn, run_id)
+    except Exception:
+        pass
 
     # Check if events already exist — skip detection if so (fast path for demo)
     existing_count = _query(conn, f"SELECT COUNT(*) AS C FROM {DATABASE}.ACTION.BUSINESS_EVENT")
     has_existing_events = existing_count and int(existing_count[0].get("C", 0)) > 0
 
-    # Phase 1: Detect (skip if events already present)
+    # Phase 1: Detect
     if has_existing_events:
         if progress_callback:
             progress_callback("phase1_start", "Checking existing detected events...")
             progress_callback("phase1_done", f"Using {existing_count[0]['C']} existing events (skip re-detection)")
         results["phases"]["detect"] = {"inserted": 0, "refreshed": 0, "skipped": True}
     else:
+        det_count = len(detectors) if detectors else 6
         if progress_callback:
-            progress_callback("phase1_start", "Scanning 6 detector views for procurement anomalies...")
+            progress_callback("phase1_start", f"Scanning {det_count} detector views for procurement anomalies...")
         try:
-            detect_result = phase_detect(conn, run_id, progress_callback=lambda msg: progress_callback("phase1_detail", msg) if progress_callback else None)
+            detect_result = phase_detect(conn, run_id,
+                                         progress_callback=lambda msg: progress_callback("phase1_detail", msg) if progress_callback else None,
+                                         detectors=detectors, period_days=period_days)
             results["phases"]["detect"] = detect_result
             if progress_callback:
                 progress_callback("phase1_done", f"Detected {detect_result['inserted']} new events, refreshed {detect_result['refreshed']}")
@@ -609,11 +862,12 @@ def run_full_pipeline_with_cases(conn, run_id, progress_callback=None, limit=20)
             results["errors"].append(f"Phase 1: {e}")
             if progress_callback:
                 progress_callback("phase1_error", str(e))
+            _end_workflow_run(conn, run_id, "failed", results)
             return results
 
-    # Phase 2: Investigate
+    # Phase 2: Investigate (batch evidence pre-fetch)
     if progress_callback:
-        progress_callback("phase2_start", "Running Five-Why evidence traversal (7-hop graph walk)...")
+        progress_callback("phase2_start", "Running Five-Why evidence traversal (batch graph walk)...")
     try:
         inv_results = phase_investigate(conn, run_id, limit=limit,
                                         progress_callback=lambda msg: progress_callback("phase2_detail", msg) if progress_callback else None)
@@ -624,6 +878,7 @@ def run_full_pipeline_with_cases(conn, run_id, progress_callback=None, limit=20)
         results["errors"].append(f"Phase 2: {e}")
         if progress_callback:
             progress_callback("phase2_error", str(e))
+        _end_workflow_run(conn, run_id, "failed", results)
         return results
 
     # Phase 3: Risk Assessment
@@ -640,9 +895,10 @@ def run_full_pipeline_with_cases(conn, run_id, progress_callback=None, limit=20)
         results["errors"].append(f"Phase 3: {e}")
         if progress_callback:
             progress_callback("phase3_error", str(e))
+        _end_workflow_run(conn, run_id, "failed", results)
         return results
 
-    # Phase 4: Action Planning
+    # Phase 4: Action Planning (populates APPROVAL_QUEUE, PAYMENT_HOLD, SAP_CHANGE_REQUEST)
     if progress_callback:
         progress_callback("phase4_start", "Selecting actions from catalog, gating money-touching decisions...")
     try:
@@ -655,13 +911,13 @@ def run_full_pipeline_with_cases(conn, run_id, progress_callback=None, limit=20)
         results["errors"].append(f"Phase 4: {e}")
         if progress_callback:
             progress_callback("phase4_error", str(e))
+        _end_workflow_run(conn, run_id, "failed", results)
         return results
 
-    # Phase 5: Create Cases + Audit Trail
+    # Phase 5: Create Cases + Notifications (batch)
     if progress_callback:
-        progress_callback("phase5_start", "Creating procurement cases and audit trail...")
+        progress_callback("phase5_start", "Creating procurement cases and sending notifications...")
     try:
-        # Query completed investigations with risk to create cases
         case_data = _query(conn, f"""
             SELECT e.EVENT_ID, e.EVENT_TYPE, e.ENTITY_KEY, e.SEVERITY, e.IMPACT_USD, e.HEADLINE,
                    i.INVESTIGATION_ID, i.ROOT_CAUSE_BRANCH, i.CONFIDENCE, i.NARRATIVE,
@@ -677,10 +933,11 @@ def run_full_pipeline_with_cases(conn, run_id, progress_callback=None, limit=20)
         """, (run_id, run_id, run_id, limit))
 
         cases_created = 0
+        persona_cases = {}  # group cases by owner for per-persona email
+
         for row in case_data:
             existing = get_case_by_event(row["EVENT_ID"])
             if existing:
-                # Update existing case
                 update_case_status(existing["CASE_ID"], "AI_INVESTIGATED",
                                    risk_level=row["SEVERITY"],
                                    risk_score=float(row.get("RISK_SCORE") or 0),
@@ -689,7 +946,7 @@ def run_full_pipeline_with_cases(conn, run_id, progress_callback=None, limit=20)
                                    root_cause=row.get("ROOT_CAUSE_BRANCH", ""),
                                    recommendation=_get_recommendation(row))
                 audit_log(existing["CASE_ID"], "INVESTIGATION_COMPLETED", "AI_AGENT", "Investigation Agent",
-                          f"Root cause: {row.get('ROOT_CAUSE_BRANCH')}. Score: {row.get('RISK_SCORE')}")
+                          f"Root cause: {BRANCH_FRIENDLY.get(row.get('ROOT_CAUSE_BRANCH', ''), row.get('ROOT_CAUSE_BRANCH', ''))}. Score: {row.get('RISK_SCORE')}")
             else:
                 vendor_name = row.get("VENDOR_NAME") or row.get("ENTITY_KEY", "Unknown")
                 case_id = create_case(
@@ -713,19 +970,67 @@ def run_full_pipeline_with_cases(conn, run_id, progress_callback=None, limit=20)
                                    recommendation=_get_recommendation(row))
                 cases_created += 1
 
+            # Group by persona for summary email
+            owner = row.get("RECOMMENDED_OWNER", "procurement_manager")
+            persona_cases.setdefault(owner, []).append(row)
+
+        # Send per-persona summary emails (one email per persona, not per case)
+        emails_sent = 0
+        for persona, cases in persona_cases.items():
+            try:
+                emails_sent += _send_persona_summary_email(conn, run_id, persona, cases)
+            except Exception:
+                pass
+
+        # NOTE: NOTIFICATION_OUTBOX is populated by SP_SEND_NOTIFICATION (called from _send_persona_summary_email)
+        # No manual outbox insert needed here.
+
+        GATED_BRANCHES = {"price_variance", "goods_receipt_no_invoice", "duplicate_ir"}
+        awaiting_count = 0
+        for row in case_data:
+            branch = row.get("ROOT_CAUSE_BRANCH", "")
+            if branch in GATED_BRANCHES:
+                case_row = get_case_by_event(row["EVENT_ID"])
+                if case_row and case_row.get("STATUS") == "AI_INVESTIGATED":
+                    update_case_status(case_row["CASE_ID"], "AWAITING_DECISION")
+                    audit_log(case_row["CASE_ID"], "ACTION_RECOMMENDED", "AI_AGENT", "Planning Agent",
+                              f"Action requires approval: {_get_recommendation(row)}")
+                    awaiting_count += 1
+
+        # Log notifications with friendly persona names
+        for persona, cases in persona_cases.items():
+            friendly_persona = OWNER_FRIENDLY.get(persona, persona.replace("_", " ").title())
+            for c in cases:
+                case_row = get_case_by_event(c["EVENT_ID"])
+                if case_row:
+                    audit_log(case_row["CASE_ID"], "NOTIFICATION_SENT", "SYSTEM", "Notification Agent",
+                              f"Email alert sent to {friendly_persona}")
+
         results["cases_created"] = cases_created
+        results["emails_sent"] = emails_sent
+        results["awaiting_decision"] = awaiting_count
         if progress_callback:
-            progress_callback("phase5_done", f"Created {cases_created} procurement cases with full audit trail")
+            progress_callback("phase5_done", f"Created {cases_created} cases, sent {emails_sent} email alerts, {awaiting_count} awaiting decision")
     except Exception as e:
         results["errors"].append(f"Phase 5: {e}")
         if progress_callback:
             progress_callback("phase5_error", str(e))
 
+    # Summary counts for UI
+    results["events_detected"] = len(results["phases"].get("detect", {}).get("events", [])) or int(results["phases"].get("detect", {}).get("inserted", 0))
+    results["investigations"] = len(results["phases"].get("investigate", []))
+    results["actions_planned"] = len(results["phases"].get("plan", []))
+
+    # End workflow run
+    try:
+        _end_workflow_run(conn, run_id, "completed", results)
+    except Exception:
+        pass
+
     return results
 
 
 def _get_recommendation(row):
-    """Derive recommendation text from risk data."""
     branch = row.get("ROOT_CAUSE_BRANCH", "")
     priority = row.get("PRIORITY", "P3")
     impact = float(row.get("IMPACT_USD") or 0)
@@ -738,3 +1043,75 @@ def _get_recommendation(row):
         "payment_terms_drift": "Review and realign payment terms with contracted baseline",
     }
     return recs.get(branch, f"Investigate and resolve {branch} ({priority})")
+
+
+def _send_persona_summary_email(conn, run_id, persona, cases):
+    """Send one summary email per persona using the shared FN_BUILD_ALERT_HTML template."""
+    total_impact = sum(float(c.get("IMPACT_USD") or 0) for c in cases)
+    impact_str = f"${total_impact/1e6:.1f}M" if total_impact >= 1e6 else f"${total_impact:,.0f}"
+    case_count = len(cases)
+
+    # Build headline from top case
+    top_case = max(cases, key=lambda c: float(c.get("IMPACT_USD") or 0))
+    headline = f"{case_count} procurement cases detected — {impact_str} total exposure"
+    vendor = top_case.get("VENDOR_NAME") or top_case.get("ENTITY_KEY", "Multiple Vendors")
+    if case_count == 1:
+        headline = (top_case.get("HEADLINE") or headline)[:200]
+
+    # Build priority from worst case
+    priorities = [c.get("PRIORITY", "P3") for c in cases]
+    worst_priority = min(priorities) if priorities else "P3"
+
+    # Build actions list — deduplicate and make them strategic (not per-case repetition)
+    actions = []
+    vendors_affected = list(set(
+        (c.get("VENDOR_NAME") or c.get("ENTITY_KEY", "Unknown"))[:30] for c in cases
+    ))
+    branches = list(set(c.get("ROOT_CAUSE_BRANCH", "") for c in cases))
+
+    # Strategic actions based on root cause branches present
+    if "price_variance" in branches:
+        actions.append(f"Place Payment Hold on overbilling vendors ({', '.join(vendors_affected[:3])})")
+        actions.append("Initiate vendor price reconciliation — compare PO rates vs invoiced amounts")
+        if case_count > 1:
+            actions.append(f"Qualify alternate suppliers for affected material groups ({case_count} vendors flagged)")
+    if "goods_receipt_no_invoice" in branches:
+        actions.append("Expedite invoice collection to close GR/IR gap before period close")
+        actions.append("Set up auto-reminder when GR exceeds 14 days without matching invoice")
+    if "no_goods_receipt" in branches:
+        actions.append("Review blocked/disputed AP items — clear aged backlog")
+        actions.append("Escalate items >90 days past due for CFO review")
+    if not actions:
+        actions.append("Review cases in Procurement Control Tower")
+        actions.append("Approve or reject pending payment holds")
+        actions.append("Escalate P1 items for immediate resolution")
+
+    actions_str = ";".join(actions[:5])
+
+    # Get plants and root cause
+    plants = list(set(c.get("PLANT_NAME", "") for c in cases if c.get("PLANT_NAME")))
+    plant_str = ", ".join(plants[:3]) if plants else "All Plants"
+    root_cause = top_case.get("ROOT_CAUSE_BRANCH", "")
+    root_cause_friendly = BRANCH_FRIENDLY.get(root_cause, root_cause.replace("_", " ").title())
+    confidence = float(top_case.get("CONFIDENCE") or top_case.get("RISK_SCORE") or 75)
+
+    # Use the shared SQL function to build HTML
+    html_rows = _query(conn, f"""
+        SELECT {DATABASE}.ACTION.FN_BUILD_ALERT_HTML(
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+        ) AS HTML
+    """, (worst_priority, persona, headline, total_impact, vendor, plant_str,
+          root_cause_friendly, confidence, actions_str, run_id))
+
+    if not html_rows or not html_rows[0].get("HTML"):
+        return 0
+
+    email_html = html_rows[0]["HTML"]
+    owner_display = OWNER_FRIENDLY.get(persona, persona.replace("_", " ").title())
+    safe_subject = f"ProcureAI Summary [{owner_display}]: {case_count} cases, {impact_str} exposure"
+
+    # Send via SP (handles outbox + delivery)
+    _execute(conn, f"""
+        CALL {DATABASE}.ACTION.SP_SEND_NOTIFICATION(%s, NULL, %s, %s, %s, FALSE)
+    """, (run_id, persona, safe_subject, email_html))
+    return 1
