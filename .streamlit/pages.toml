@@ -1,0 +1,15 @@
+[[pages]]
+path = "Agentic_Control_Tower.py"
+name = "Agentic Control Tower"
+
+[[pages]]
+path = "pages/2_Dashboard.py"
+name = "Procurement Dashboard"
+
+[[pages]]
+path = "pages/3_Ask_Data.py"
+name = "Talk to Your Data"
+
+[[pages]]
+path = "pages/4_How_It_Works.py"
+name = "How It Works"
