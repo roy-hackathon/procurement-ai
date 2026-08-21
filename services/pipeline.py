@@ -391,10 +391,10 @@ def _investigate_event_cached(conn, run_id, event, evidence_cache):
 
     # Parse GR/IR from raw
     gr_ir_raw = vendor_evidence.get("hop2_gr_ir_raw", [])
-    gr_value = sum(float(r["TOTAL_VALUE"]) for r in gr_ir_raw if r["EVENT_TYPE"] == 1)
-    ir_value = sum(float(r["TOTAL_VALUE"]) for r in gr_ir_raw if r["EVENT_TYPE"] == 2)
-    gr_count = sum(int(r["CNT"]) for r in gr_ir_raw if r["EVENT_TYPE"] == 1)
-    ir_count = sum(int(r["CNT"]) for r in gr_ir_raw if r["EVENT_TYPE"] == 2)
+    gr_value = sum(float(r["TOTAL_VALUE"]) for r in gr_ir_raw if str(r["EVENT_TYPE"]) == '1')
+    ir_value = sum(float(r["TOTAL_VALUE"]) for r in gr_ir_raw if str(r["EVENT_TYPE"]) == '2')
+    gr_count = sum(int(r["CNT"]) for r in gr_ir_raw if str(r["EVENT_TYPE"]) == '1')
+    ir_count = sum(int(r["CNT"]) for r in gr_ir_raw if str(r["EVENT_TYPE"]) == '2')
     evidence["hop2_gr_ir"] = {"gr_value": gr_value, "ir_value": ir_value, "gr_count": gr_count, "ir_count": ir_count}
 
     inv_data = vendor_evidence.get("hop3_invoices", {})

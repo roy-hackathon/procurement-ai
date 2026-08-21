@@ -294,6 +294,16 @@ if user_input:
                         if generated_sql.lower().startswith("sql\n"):
                             generated_sql = generated_sql[4:].strip()
 
+                        # Add schema prefix if not present
+                        for tbl in ["FCT_PURCHASE_ORDERS", "FCT_AP_INVOICES", "FCT_AP_OPEN_ITEMS", "FCT_PO_HISTORY",
+                                    "FCT_GOODS_MOVEMENTS", "FCT_GL_TRANSACTIONS", "DIM_VENDOR", "DIM_MATERIAL",
+                                    "DIM_PLANT", "DIM_DATE", "DIM_COMPANY_CODE", "DIM_VENDOR_COMPANY", "DIM_STORAGE_LOCATION"]:
+                            generated_sql = re.sub(
+                                rf'\b(?<!\.){tbl}\b',
+                                f'SAP_P2P_FINANCE_DEV.GOLD.{tbl}',
+                                generated_sql
+                            )
+
                         if generated_sql.upper().startswith(("SELECT", "WITH")):
                             try:
                                 data_df = run_query_df(generated_sql)

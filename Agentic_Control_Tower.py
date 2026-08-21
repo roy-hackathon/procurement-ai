@@ -464,7 +464,7 @@ with st.expander("⚙️ Investigation Settings", expanded=False):
                                         default=["Invoice Over PO", "GR/IR Aging", "AP Aging"],
                                         help="Which detector views to scan")
     with cfg_col3:
-        run_period = st.selectbox("Period", ["Last 1 Month", "Last 3 Months", "Last 6 Months", "Last 1 Year"],
+        run_period = st.selectbox("Period", ["Last 6 Months", "Last 1 Year", "Last 3 Years"],
                                   index=0, help="Time window for detection")
 
 # Map UI choices to params
@@ -479,7 +479,7 @@ detector_map = {
     "Payment Terms Drift": "unusual_payment_terms",
 }
 active_detectors = [detector_map[d] for d in run_detectors]
-period_map = {"Last 1 Month": 30, "Last 3 Months": 90, "Last 6 Months": 180, "Last 1 Year": 365}
+period_map = {"Last 6 Months": 180, "Last 1 Year": 365, "Last 3 Years": 1095}
 run_period_days = period_map.get(run_period)
 
 col_left, col_center, col_right = st.columns([1, 1, 1])
