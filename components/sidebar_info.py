@@ -38,62 +38,13 @@ def render_account_info():
             masked_org = _mask_start(org_name)
             masked_acct = _mask_end(acct_name)
 
-            edition = "Unknown"
-            trial_badge = ""
-            credits_remaining = None
-            currency = "USD"
-
-            try:
-                edition_info = run_query("SELECT EDITION FROM SNOWFLAKE.ORGANIZATION_USAGE.ACCOUNTS WHERE ACCOUNT_NAME = CURRENT_ACCOUNT_NAME()")
-                if edition_info:
-                    edition = edition_info[0]["EDITION"]
-            except Exception:
-                pass
-
-            try:
-                balance_info = run_query("SELECT FREE_USAGE_BALANCE, CURRENCY FROM SNOWFLAKE.ORGANIZATION_USAGE.REMAINING_BALANCE_DAILY ORDER BY DATE DESC LIMIT 1")
-                if balance_info:
-                    credits_remaining = float(balance_info[0]["FREE_USAGE_BALANCE"])
-                    currency = balance_info[0]["CURRENCY"]
-            except Exception:
-                pass
-
-            if credits_remaining is not None and credits_remaining > 0:
-                trial_badge = "🟢 Free Trial"
-
-            credit_color = "#059669"
-            credit_label = ""
-            credit_icon = ""
-            if credits_remaining is not None:
-                if credits_remaining < 75:
-                    credit_color = "#1e293b"
-                    credit_label = "Critical"
-                    credit_icon = "⚫"
-                elif credits_remaining < 150:
-                    credit_color = "#b91c1c"
-                    credit_label = "Low"
-                    credit_icon = "🔴"
-                elif credits_remaining < 225:
-                    credit_color = "#d97706"
-                    credit_label = "Moderate"
-                    credit_icon = "🟠"
-                else:
-                    credit_color = "#059669"
-                    credit_label = "Healthy"
-                    credit_icon = "🟢"
-
-            credits_row = ""
-            if credits_remaining is not None:
-                credits_row = f'<tr><td style="padding:2px 0;color:#6b7280;">Credits</td><td style="padding:2px 0;font-weight:700;color:{credit_color};">{credit_icon} {credit_label}</td></tr>'
-
             st.markdown(f"""
             <div style="background:#f0f9ff;border:1px solid #bae6fd;border-radius:8px;padding:14px 16px;margin-bottom:16px;">
                 <div style="font-weight:700;font-size:13px;color:#0369a1;margin-bottom:8px;">❄️ Snowflake Account</div>
                 <table style="width:100%;font-size:12px;color:#334155;">
                     <tr><td style="padding:2px 0;color:#6b7280;">Account</td><td style="padding:2px 0;font-weight:600;">{masked_org}-{masked_acct}</td></tr>
                     <tr><td style="padding:2px 0;color:#6b7280;">Region</td><td style="padding:2px 0;">{region}</td></tr>
-                    <tr><td style="padding:2px 0;color:#6b7280;">Edition</td><td style="padding:2px 0;">{edition} {trial_badge}</td></tr>
-                    {credits_row}
+                    <tr><td style="padding:2px 0;color:#6b7280;">Edition</td><td style="padding:2px 0;">Enterprise (Free Trial)</td></tr>
                     <tr><td style="padding:2px 0;color:#6b7280;">Cortex Agent</td><td style="padding:2px 0;font-weight:600;color:#059669;">Enabled</td></tr>
                     <tr><td style="padding:2px 0;color:#6b7280;">AI Function</td><td style="padding:2px 0;font-weight:600;color:#059669;">Enabled</td></tr>
                 </table>
