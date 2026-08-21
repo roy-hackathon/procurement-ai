@@ -276,7 +276,7 @@ if user_input:
                         "Return ONLY the SQL query. No markdown, no explanation, no backticks."
                     ).replace("'", "''")
 
-                    fallback_sql = f"SELECT SNOWFLAKE.CORTEX.COMPLETE('claude-3-5-haiku', '{prompt}') AS RESPONSE"
+                    fallback_sql = f"SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-70b', '{prompt}') AS RESPONSE"
                     logger.debug(f"Fallback SQL: {fallback_sql[:300]}")
 
                     fallback_result = run_query(fallback_sql)

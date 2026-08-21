@@ -767,7 +767,7 @@ if user_q:
 
                 # If LLM says it needs SQL, fall back to Cortex Complete SQL generation
                 if "NEED_SQL_QUERY" in answer or not answer:
-                    logger.info("Context insufficient, falling back to SQL generation via claude-3-5-haiku")
+                    logger.info("Context insufficient, falling back to SQL generation via llama3.1-70b")
                     sql_prompt = (
                         "You are a procurement data analyst for CoCoEV, an electric scooter manufacturer. "
                         "Write a Snowflake SQL query to answer the question below.\\n\\n"
@@ -794,7 +794,7 @@ if user_q:
                         "Return ONLY the SQL query. No markdown, no explanation, no backticks, no comments."
                     ).replace("'", "''")
 
-                    sql_result = run_query_df(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('claude-3-5-haiku', '{sql_prompt}') AS RESPONSE")
+                    sql_result = run_query_df(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-70b', '{sql_prompt}') AS RESPONSE")
                     if not sql_result.empty:
                         generated_sql = sql_result.iloc[0]["RESPONSE"].strip().strip('`').strip()
                         if generated_sql.startswith("sql"):
@@ -815,7 +815,7 @@ if user_q:
                             if not data_df.empty:
                                 # Generate a natural language summary of the results
                                 summary_prompt = f"Summarize this data in 1-2 sentences for a procurement manager. Be specific with numbers. Data: {data_df.head(10).to_string()}. Question was: {user_q}".replace("'", "''")
-                                summary_result = run_query_df(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('claude-3-5-haiku', '{summary_prompt}') AS S")
+                                summary_result = run_query_df(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-70b', '{summary_prompt}') AS S")
                                 summary = summary_result.iloc[0]["S"].strip() if not summary_result.empty else "Here are the results:"
                                 st.markdown(summary)
                                 st.dataframe(data_df, use_container_width=True, hide_index=True)
