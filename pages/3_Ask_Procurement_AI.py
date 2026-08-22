@@ -337,6 +337,11 @@ if user_input:
                         st.session_state["ask_history"].append({"role": "assistant", "content": "No response from fallback."})
                 except Exception as fallback_err:
                     logger.error(f"Fallback also failed: {fallback_err}", exc_info=True)
-                    error_msg = f"Query failed: {str(fallback_err)[:200]}"
-                    st.error(error_msg)
-                    st.session_state["ask_history"].append({"role": "assistant", "content": error_msg})
+                    st.error("AI function execution is currently unavailable.")
+                    st.warning(
+                        "This may be due to Snowflake Free Trial edition limitations — "
+                        "Cortex AI functions (COMPLETE, Analyst, Agent) can be intermittently "
+                        "restricted on trial accounts. Please try again in a few minutes, or "
+                        "upgrade to a paid edition for consistent AI function access."
+                    )
+                    st.session_state["ask_history"].append({"role": "assistant", "content": "AI function unavailable — Free Trial edition may have blocked execution."})

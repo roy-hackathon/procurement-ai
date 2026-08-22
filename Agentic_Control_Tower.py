@@ -99,8 +99,11 @@ def _generate_case_report(case):
                 hyp_list = json.loads(hyps) if isinstance(hyps, str) else hyps
                 if isinstance(hyp_list, list):
                     for h in hyp_list:
-                        score = float(h.get("score", 0)) * 100
-                        hyp_html += f"<tr><td>{h.get('branch','')}</td><td>{score:.0f}%</td><td>{h.get('reason','')}</td></tr>"
+                        if isinstance(h, dict):
+                            score = float(h.get("score", 0)) * 100
+                            hyp_html += f"<tr><td>{h.get('branch','')}</td><td>{score:.0f}%</td><td>{h.get('reason','')}</td></tr>"
+                        else:
+                            hyp_html += f"<tr><td colspan='3'>{str(h)}</td></tr>"
                 else:
                     hyp_html += f"<tr><td colspan='3'>{str(hyps)}</td></tr>"
             except (json.JSONDecodeError, TypeError):
@@ -283,14 +286,23 @@ OWNER_LABELS = {
     "unusual_payment_terms": "Procurement Analyst",
 }
 
+# 1:1 mapping: each event type belongs to exactly one persona tab
+EVENT_TYPE_PRIMARY_OWNER = {
+    "invoice_over_po": "category_manager",
+    "grir_aging": "procurement_manager",
+    "ap_open_item_aging": "finance_manager",
+    "duplicate_invoice_receipt": "finance_manager",
+    "po_invoice_currency_mismatch": "procurement_analyst",
+    "unusual_payment_terms": "procurement_analyst",
+}
+
 # Persona-based tab mapping
 PERSONA_TAB_CONFIG = {
-    "procurement_manager": {"label": "Procurement Manager", "types": ["invoice_over_po", "grir_aging"]},
-    "finance_manager": {"label": "Finance Manager", "types": ["ap_open_item_aging", "grir_aging", "duplicate_invoice_receipt"]},
-    "supply_chain_leader": {"label": "Supply Chain Leader", "types": ["grir_aging", "invoice_over_po"]},
-    "procurement_analyst": {"label": "Procurement Analyst", "types": ["unusual_payment_terms", "po_invoice_currency_mismatch"]},
     "category_manager": {"label": "Category Manager", "types": ["invoice_over_po"]},
-    "cfo_coo": {"label": "CFO / COO", "types": ["invoice_over_po", "duplicate_invoice_receipt", "grir_aging"]},
+    "procurement_manager": {"label": "Procurement Manager", "types": ["grir_aging"]},
+    "finance_manager": {"label": "Finance Manager", "types": ["ap_open_item_aging", "duplicate_invoice_receipt"]},
+    "procurement_analyst": {"label": "Procurement Analyst", "types": ["po_invoice_currency_mismatch", "unusual_payment_terms"]},
+    "cfo_coo": {"label": "CFO / COO", "types": []},
 }
 
 # Build persona tabs
@@ -303,9 +315,9 @@ for tab_idx, persona_key in enumerate(persona_keys):
         config = PERSONA_TAB_CONFIG[persona_key]
         st.caption(f"Cases assigned to **{config['label']}** for review and action.")
 
-        # Get cases for this persona
-        if not df_cases.empty:
-            persona_cases = df_cases[df_cases["OWNER"] == persona_key]
+        # Get cases for this persona (filter by CASE_TYPE — each type maps to exactly one persona)
+        if not df_cases.empty and config["types"]:
+            persona_cases = df_cases[df_cases["CASE_TYPE"].isin(config["types"])]
         else:
             persona_cases = pd.DataFrame()
 
@@ -371,79 +383,31 @@ for tab_idx, persona_key in enumerate(persona_keys):
                     else:
                         st.caption(row.get("STATUS", ""))
         else:
-            # No cases directly owned — show cases matching this persona's event types
-            relevant_types = config["types"]
-            if not df_cases.empty:
-                type_cases = df_cases[df_cases["CASE_TYPE"].isin(relevant_types)]
+            if config["types"]:
+                st.info(f"No cases assigned to {config['label']} yet. Run AI Investigation to detect and assign cases.")
             else:
-                type_cases = pd.DataFrame()
-
-            if not type_cases.empty:
-                # Show cases with View Case button (same layout as owner tab)
-                hcol1, hcol2, hcol3, hcol4, hcol5 = st.columns([1, 2, 3, 2, 2])
-                with hcol1:
-                    st.markdown("**Priority**")
-                with hcol2:
-                    st.markdown("**Supplier**")
-                with hcol3:
-                    st.markdown("**Impact — Type**")
-                with hcol4:
-                    st.markdown("**Status**")
-                with hcol5:
-                    st.markdown("**Action**")
-
-                for _, row in type_cases.head(5).iterrows():
-                    case_id = row["CASE_ID"]
-                    col1, col2, col3, col4, col5 = st.columns([1, 2, 3, 2, 2])
-                    with col1:
-                        sev = row.get("RISK_LEVEL", "MEDIUM")
-                        color = {"CRITICAL": "#dc2626", "HIGH": "#ea580c", "MEDIUM": "#2563eb"}.get(sev, "#666")
-                        st.markdown(f'<span style="background:{color};color:white;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">{sev}</span>', unsafe_allow_html=True)
-                    with col2:
-                        st.markdown(f"**{row.get('VENDOR_NAME', '')}**")
-                        st.caption(f"{case_id}")
-                    with col3:
-                        impact = float(row.get("FINANCIAL_IMPACT") or 0)
-                        impact_str = f"${impact/1e6:.1f}M" if impact >= 1e6 else f"${impact:,.0f}"
-                        case_type_label = CATEGORY_LABELS.get(row.get("CASE_TYPE", ""), row.get("CASE_TYPE", ""))
-                        st.caption(f"{impact_str} — {case_type_label}")
-                    with col4:
-                        status_raw = row.get("STATUS", "")
-                        status_labels = {
-                            "AI_INVESTIGATED": "AI Investigated",
-                            "AWAITING_DECISION": "Awaiting Decision",
-                            "NEW": "New",
-                            "ACTION_EXECUTED": "Action Executed",
-                            "RESOLVED": "Resolved",
-                            "INVESTIGATING": "Investigating",
-                        }
-                        status_label = status_labels.get(status_raw, status_raw)
-                        confidence = row.get("RISK_SCORE", "")
-                        conf_str = f"{float(confidence):.0f}%" if confidence else ""
-                        st.markdown(f"**{status_label}**")
-                        if status_raw == "AI_INVESTIGATED" and conf_str:
-                            st.caption(f"Root cause identified · Confidence {conf_str}")
-                        elif status_raw == "AWAITING_DECISION":
-                            st.caption("Pending human approval")
-                        elif status_raw == "NEW":
-                            st.caption("Awaiting investigation")
-                    with col5:
-                        if st.button("📂 View Case", key=f"act_{case_id}_{tab_idx}_alt", type="secondary"):
-                            st.session_state["selected_case"] = case_id
-                            st.toast(f"Viewing case {case_id} — scroll down for details", icon="👇")
-                            st.rerun()
-            elif not all_events_df.empty:
-                cat_events = all_events_df[all_events_df["EVENT_TYPE"].isin(relevant_types)]
-                if not cat_events.empty:
-                    display = cat_events[["SEVERITY", "ENTITY_KEY", "EVENT_TYPE", "IMPACT_USD", "HEADLINE"]].head(5).copy()
-                    display["EVENT_TYPE"] = display["EVENT_TYPE"].map(CATEGORY_LABELS).fillna(display["EVENT_TYPE"])
-                    display["IMPACT_USD"] = display["IMPACT_USD"].apply(lambda x: f"${float(x or 0):,.0f}")
-                    display.columns = ["Severity", "Entity", "Type", "Impact", "Headline"]
-                    st.dataframe(display, use_container_width=True, hide_index=True)
+                # CFO/COO tab — show escalated/critical cases only
+                if not df_cases.empty:
+                    critical = df_cases[df_cases["RISK_LEVEL"] == "CRITICAL"]
+                    if not critical.empty:
+                        st.caption(f"**{len(critical)}** critical case(s) escalated for executive review.")
+                        for _, row in critical.head(5).iterrows():
+                            case_id = row["CASE_ID"]
+                            col1, col2, col3 = st.columns([2, 3, 2])
+                            with col1:
+                                st.markdown(f"**{row.get('VENDOR_NAME', '')}**")
+                            with col2:
+                                impact = float(row.get("FINANCIAL_IMPACT") or 0)
+                                impact_str = f"${impact/1e6:.1f}M" if impact >= 1e6 else f"${impact:,.0f}"
+                                st.caption(f"{impact_str} — {CATEGORY_LABELS.get(row.get('CASE_TYPE', ''), row.get('CASE_TYPE', ''))}")
+                            with col3:
+                                if st.button("📂 View", key=f"cfo_{case_id}_{tab_idx}"):
+                                    st.session_state["selected_case"] = case_id
+                                    st.rerun()
+                    else:
+                        st.info("No critical cases requiring executive escalation.")
                 else:
-                    st.info(f"No events for {config['label']}.")
-            else:
-                st.info("No events detected yet.")
+                    st.info("No cases yet. Run AI Investigation to begin.")
 
 st.divider()
 
@@ -719,29 +683,42 @@ if not df_cases.empty:
                 inv = inv_data[0]
                 with st.expander("Five-Why Analysis", expanded=True):
                     narrative = inv.get("NARRATIVE", "")
+                    confidence = inv.get("CONFIDENCE")
+                    root_branch = inv.get("ROOT_CAUSE_BRANCH", "")
                     import re
-                    # Try splitting on newlines first (pipeline format), then on (1)/(2) markers (CoCo format)
+
+                    # Try splitting on newlines first (pipeline format)
                     lines = [l.strip() for l in narrative.split("\n") if l.strip()]
                     if len(lines) >= 3:
                         steps = lines
                     else:
-                        steps = [s.strip() for s in re.split(r'\(\d+\)\s*', narrative) if s.strip()]
+                        # Try splitting on (1)/(2) markers
+                        marker_split = [s.strip() for s in re.split(r'\(\d+\)\s*', narrative) if s.strip()]
+                        if len(marker_split) >= 3:
+                            steps = marker_split
+                        else:
+                            # Split prose on sentence boundaries for readable display
+                            sentences = [s.strip() for s in re.split(r'(?<=[.!])\s+', narrative) if s.strip()]
+                            steps = sentences if len(sentences) >= 2 else [narrative]
 
                     if steps:
-                        why_num = 0
-                        for step in steps:
+                        # Show root cause branch as header
+                        branch_label = BRANCH_LABELS.get(root_branch, root_branch.replace("_", " ").title()) if root_branch else ""
+                        if branch_label:
+                            st.markdown(f"**Root Cause Branch:** `{branch_label}`" + (f" — Confidence: **{confidence}%**" if confidence else ""))
+
+                        for why_num, step in enumerate(steps, 1):
                             escaped = step.replace('$', '\\$')
-                            # Strip leading "N." if already numbered
                             escaped = re.sub(r'^\d+\.\s*', '', escaped)
                             if not escaped:
                                 continue
 
-                            # First line is title/header (contains "Five-Why" or "Investigation for") — show without number
-                            if why_num == 0 and ("five-why" in escaped.lower() or "investigation for" in escaped.lower()):
-                                st.markdown(f"**{escaped}**")
-                                continue
-
-                            why_num += 1
+                            # Highlight "Root cause:" prefix
+                            if "root cause:" in escaped.lower():
+                                parts = re.split(r'(?i)(root cause:)', escaped, 1)
+                                if len(parts) >= 3:
+                                    st.markdown(f"**{why_num}. 💡** <span style='color:#1e40af;font-weight:600;'>{parts[1]}</span> {parts[2]}", unsafe_allow_html=True)
+                                    continue
 
                             # Split question from answer on "?" boundary
                             if "?" in escaped and not escaped.endswith("?"):
@@ -753,12 +730,9 @@ if not df_cases.empty:
                                 parts = escaped.split("→", 1)
                                 st.markdown(f"**{why_num}.** {parts[0].strip()} → <span style='color:#2563eb;'>{parts[1].strip()}</span>", unsafe_allow_html=True)
                             elif escaped.lower().startswith("business impact"):
-                                # Business Impact is the conclusion — highlight in bold blue
                                 st.markdown(f"**{why_num}. 💡** <span style='color:#1e40af;font-weight:600;'>{escaped}</span>", unsafe_allow_html=True)
                             else:
                                 st.markdown(f"**{why_num}.** {escaped}")
-                    else:
-                        st.markdown(f"- {narrative.replace('$', chr(92)+'$')}")
 
                 with st.expander("Ranked Hypotheses"):
                     hyps = inv.get("HYPOTHESES")
@@ -766,18 +740,20 @@ if not df_cases.empty:
                         try:
                             hyp_list = json.loads(hyps) if isinstance(hyps, str) else hyps
                             if isinstance(hyp_list, list):
-                                for h in hyp_list:
-                                    score = float(h.get("score", 0)) * 100
-                                    reason = h.get("reason", "").replace("$", "\\$")
-                                    branch_label = BRANCH_LABELS.get(h.get("branch", ""), h.get("branch", ""))
-                                    st.markdown(f"**{branch_label}** ({score:.0f}%) — {reason}")
+                                for idx, h in enumerate(hyp_list, 1):
+                                    if isinstance(h, dict):
+                                        score = float(h.get("score", 0)) * 100
+                                        reason = h.get("reason", "").replace("$", "\\$")
+                                        branch_label = BRANCH_LABELS.get(h.get("branch", ""), h.get("branch", ""))
+                                        st.markdown(f"**{idx}. {branch_label}** ({score:.0f}%) — {reason}")
+                                    else:
+                                        st.markdown(f"**{idx}.** {str(h).replace('$', chr(92)+'$')}")
                             else:
                                 st.markdown(str(hyps).replace("$", "\\$"))
                         except (json.JSONDecodeError, TypeError):
-                            # Plain text hypotheses - display as-is
                             for line in str(hyps).split("\n"):
                                 if line.strip():
-                                    st.markdown(f"**{line.strip().replace('$', chr(92)+'$')}**" if line[0].isalpha() else line.replace("$", "\\$"))
+                                    st.markdown(f"- {line.strip().replace('$', chr(92)+'$')}")
 
         # Recommendation + Action
         if case.get("RECOMMENDATION"):

@@ -91,6 +91,16 @@ BRANCH_FRIENDLY = {
     "indeterminate": "Indeterminate",
 }
 
+# 1:1 mapping: each event type belongs to exactly one persona
+EVENT_TYPE_PRIMARY_OWNER = {
+    "invoice_over_po": "category_manager",
+    "grir_aging": "procurement_manager",
+    "ap_open_item_aging": "finance_manager",
+    "duplicate_invoice_receipt": "finance_manager",
+    "po_invoice_currency_mismatch": "procurement_analyst",
+    "unusual_payment_terms": "procurement_analyst",
+}
+
 OWNER_FRIENDLY = {
     "ap_manager": "AP Manager",
     "ap_clerk": "AP Clerk",
@@ -100,6 +110,11 @@ OWNER_FRIENDLY = {
     "procurement_head": "Head of Procurement",
     "cfo": "CFO",
     "plant_manager": "Plant Manager",
+    "procurement_manager": "Procurement Manager",
+    "finance_manager": "Finance Manager",
+    "procurement_analyst": "Procurement Analyst",
+    "supply_chain_leader": "Supply Chain Leader",
+    "cfo_coo": "CFO / COO",
 }
 
 
@@ -959,7 +974,7 @@ def run_full_pipeline_with_cases(conn, run_id, progress_callback=None, limit=20,
                     severity=row["SEVERITY"],
                     event_id=row["EVENT_ID"],
                     run_id=run_id,
-                    owner=row.get("RECOMMENDED_OWNER", "procurement_manager"),
+                    owner=EVENT_TYPE_PRIMARY_OWNER.get(row["EVENT_TYPE"], row.get("RECOMMENDED_OWNER", "procurement_manager")),
                 )
                 update_case_status(case_id, "AI_INVESTIGATED",
                                    risk_level=row["SEVERITY"],
